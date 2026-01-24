@@ -801,7 +801,7 @@ HOLDINGS_SCHEMA = {
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
 
 MAX_PER_SHARE_PRICE = 11.0
-MIN_PER_SHARE_PRICE = 0.01
+MIN_PER_SHARE_PRICE = 0.1
 
 
 def get_sic_division(sic_code):
@@ -860,24 +860,13 @@ def _process_filings(
         return pl.DataFrame([], schema=output_schema), False
 
     df_with_prices = df.with_columns(
-        pl.col("value").fill_null(0).alias("value_filled"),
-        pl.col("shares_or_principal_amount").fill_null(0).alias("shares_filled"),
-    ).with_columns(
-        pl.when(pl.col("shares_filled") > 0)
-        .then(pl.col("value_filled") / pl.col("shares_filled"))
-        .otherwise(pl.lit(0))
-        .alias("per_share_price")
+        (pl.col("value") / pl.col("shares_or_principal_amount")).alias("raw_price")
     )
+    median_price = df_with_prices.filter(pl.col("raw_price") > 0)["raw_price"].median()
 
-    # Get the maximum per-share price from the entire DataFrame
-    max_price = df_with_prices["per_share_price"].max()
-    min_price = df_with_prices["per_share_price"].min()
-
-    # Determine if all values need to be multiplied
-    # If the max price is less than $11, it indicates an error in the whole file
-    requires_multiplication = (max_price < MAX_PER_SHARE_PRICE) and (
-        min_price < MIN_PER_SHARE_PRICE
-    )
+    requires_multiplication = False
+    if median_price is not None and median_price < 2.0:  # Threshold of $2.00
+        requires_multiplication = True
 
     updated_df = (
         df_with_prices.filter(
@@ -892,10 +881,9 @@ def _process_filings(
             .alias("issuer_name_clean")
         )
         .with_columns(
-            # Apply the conditional logic to every row
             pl.when(pl.lit(requires_multiplication))
-            .then(pl.col("value_filled") * 1000)
-            .otherwise(pl.col("value_filled"))
+            .then(pl.col("value") * 1000)
+            .otherwise(pl.col("value"))
             .alias("corrected_value")
         )
         .group_by(["cusip", "put_or_call"])
