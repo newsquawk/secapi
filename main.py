@@ -352,6 +352,7 @@ def get_filings(
         "filing_date": "f.filing_date",
         "period_of_report": "f.period_of_report",
         "created_at": "f.created_at",
+        "aum": "c.aum",
     }
 
     if sort_by not in allowed_sort_columns:
@@ -369,44 +370,75 @@ def get_filings(
 
     try:
         # Get the total count of filings for pagination metadata
-        count_query = "SELECT COUNT(*) FROM filings"
-        db.execute(count_query)
-        total_count = db.fetchone()["count"]  # type: ignore
+        if sort_by == "aum":
+            # Logic: If we sort by AUM, we only want the LATEST filing for each company.
+            # Otherwise, we see the same company listed 20 times with the same AUM.
 
-        order_by_clause = f"{sort_column} {sort_order_str}"
-        if sort_by == "filing_date":
-            order_by_clause += f", f.created_at {sort_order_str}"
+            # 1. Count unique companies (instead of total filings)
+            count_query = "SELECT COUNT(DISTINCT company_id) as count FROM filings"
+            db.execute(count_query)
+            total_count = db.fetchone()["count"]
+
+            # 2. Query for Distinct Latest Filings sorted by AUM
+            # We use DISTINCT ON to grab the latest, then wrap it to sort by AUM.
+            filings_query = f"""
+                WITH LatestFilings AS (
+                    SELECT DISTINCT ON (f.company_id)
+                        f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                        f.file_number, f.filing_directory, f.created_at, f.updated_at,
+                        c.company_name, c.cik_number, c.aum
+                    FROM filings f
+                    LEFT JOIN companies c ON f.company_id = c.company_id
+                    -- Internal Sort: Ensure we grab the latest filing for the distinct logic
+                    ORDER BY f.company_id, f.filing_date DESC, f.accession_number DESC
+                )
+                SELECT * FROM LatestFilings
+                -- Final Sort: Order the distinct list by AUM
+                ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST
+                LIMIT %s OFFSET %s
+            """
+
+            db.execute(filings_query, (limit, offset))
+            filings_data = db.fetchall()
         else:
-            order_by_clause += ", f.filing_date DESC, f.created_at DESC"
+            count_query = "SELECT COUNT(*) FROM filings"
+            db.execute(count_query)
+            total_count = db.fetchone()["count"]  # type: ignore
 
-        if total_count == 0:
-            return {
-                "filings": [],
-                "pagination": {
-                    "limit": limit,
-                    "offset": offset,
-                    "total": 0,
-                    "has_more": False,
-                },
-                "sorting": {
-                    "current_sort_by": sort_by,
-                    "current_sort_order": sort_order,
-                },
-            }
+            order_by_clause = f"{sort_column} {sort_order_str}"
+            if sort_by == "filing_date":
+                order_by_clause += f", f.created_at {sort_order_str}"
+            else:
+                order_by_clause += ", f.filing_date DESC, f.created_at DESC"
 
-        filings_query = f"""
-            SELECT
-                f.accession_number, f.form_type, f.filing_date, f.period_of_report,
-                f.file_number, f.filing_directory, f.created_at, f.updated_at,
-                c.company_name, c.cik_number, c.aum
-            FROM filings f
-            LEFT JOIN companies c ON f.company_id = c.company_id
-            ORDER BY {order_by_clause}
-            LIMIT %s OFFSET %s
-        """
+            if total_count == 0:
+                return {
+                    "filings": [],
+                    "pagination": {
+                        "limit": limit,
+                        "offset": offset,
+                        "total": 0,
+                        "has_more": False,
+                    },
+                    "sorting": {
+                        "current_sort_by": sort_by,
+                        "current_sort_order": sort_order,
+                    },
+                }
 
-        db.execute(filings_query, (limit, offset))
-        filings_data = db.fetchall()
+            filings_query = f"""
+                SELECT
+                    f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                    f.file_number, f.filing_directory, f.created_at, f.updated_at,
+                    c.company_name, c.cik_number, c.aum
+                FROM filings f
+                LEFT JOIN companies c ON f.company_id = c.company_id
+                ORDER BY {order_by_clause}
+                LIMIT %s OFFSET %s
+            """
+
+            db.execute(filings_query, (limit, offset))
+            filings_data = db.fetchall()
 
         # Format the response using the Pydantic model
         filings = filings_data
