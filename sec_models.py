@@ -1,10 +1,14 @@
 from pydantic import BaseModel
 from datetime import date, datetime
 from typing import Optional
+from typing import List
 
 
-# Pydantic model for a single filing
 class Filing(BaseModel):
+    """
+    Represents a single SEC filing.
+    """
+
     accession_number: str
     form_type: str
     filing_date: date
@@ -16,6 +20,8 @@ class Filing(BaseModel):
 
 
 class Holding(BaseModel):
+    """Represents a single holding within a filing."""
+
     holding_id: int
     issuer_name: str
     title_of_class: str
@@ -28,3 +34,58 @@ class Holding(BaseModel):
     voting_authority_shared: Optional[int] = None
     voting_authority_none: Optional[int] = None
     cusip: Optional[str] = None
+
+
+class HoldingActivity(BaseModel):
+    """Represents a single change (one 'headline') from a filing."""
+
+    # Company Info
+    cik: str
+    company_name: str
+    aum: Optional[int] = None
+
+    # Filing Info
+    latest_accession_number: str
+    previous_accession_number: Optional[str] = None
+    reporting_period: date
+    filing_date: date
+
+    # Stock/Holding Info
+    issuer_name: str
+    cusip: str
+    is_common_stock: bool
+
+    # Change Info
+    change_type: str  # 'new', 'closed', 'increased', 'decreased'
+    current_shares: Optional[int] = None
+    previous_shares: Optional[int] = None
+    change_in_share: Optional[int] = None
+    percent_change: Optional[float] = None
+
+    # Value Info
+    current_value: Optional[int] = None
+    previous_value: Optional[int] = None
+    absolute_value_change: int
+
+    # --- ADD THESE TWO LINES ---
+    current_price_per_share: Optional[float] = None
+    previous_price_per_share: Optional[float] = None
+
+
+class LatestActivityResponse(BaseModel):
+    """The response for the latest activity/headline list endpoint."""
+
+    activities: List[HoldingActivity]
+    has_next_page: bool = False
+
+
+class FlowAnalysisResponse(BaseModel):
+    """
+    For CUSIP net aggregate analysis
+    """
+
+    period: date
+    gross_buying: float
+    gross_selling: float
+    net_flow: float
+    share_price_estimate: float | None = None

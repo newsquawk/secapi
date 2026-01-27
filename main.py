@@ -7,22 +7,24 @@ import asyncio
 from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 from fastapi import HTTPException
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import RealDictCursor
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import datetime as dt
+import pandas as pd
 
-from sec_models import Filing
+from sec_models import (
+    Filing,
+    FlowAnalysisResponse,
+    LatestActivityResponse,
+    HoldingActivity,
+)
 from sic import SIC_MAPPING
 
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
-
-last_modified = 0
-subscribers = set()
-current_data = None
 
 if DEEPSEEK_API_KEY:
     client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -396,7 +398,7 @@ def get_filings(
             SELECT
                 f.accession_number, f.form_type, f.filing_date, f.period_of_report,
                 f.file_number, f.filing_directory, f.created_at, f.updated_at,
-                c.company_name, c.cik_number
+                c.company_name, c.cik_number, c.aum
             FROM filings f
             LEFT JOIN companies c ON f.company_id = c.company_id
             ORDER BY {order_by_clause}
@@ -1506,543 +1508,6 @@ class LatestStoriesResponse(BaseModel):
     has_next_page: bool = False
 
 
-CANDIDATE_BATCH_SIZE = 100
-
-
-@app.get("/stories/latest/", response_model=LatestStoriesResponse)
-async def get_latest_stories(
-    limit: int = Query(20, description="Number of stories to return", ge=1, le=50),
-    offset: int = Query(
-        0, description="Number of stories to skip for pagination", ge=0
-    ),
-    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
-):
-    """
-    Retrieves a list of the latest filings, each with a summary of its most
-    significant new holding.
-    """
-    try:
-        story_summaries = []
-        valid_stories_skipped = 0
-        candidate_offset = 0
-
-        while len(story_summaries) < limit:
-
-            # Step 1: Get the latest 'limit' number of filings.
-            latest_filings_query = """
-                WITH RankedFilings AS (
-                    SELECT
-                        f.accession_number,
-                        f.company_id,
-                        f.period_of_report,
-                        f.filing_date,
-                        c.company_name,
-                        c.cik_number,
-                        f.filing_id,
-                        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn,
-                        c.aum
-                    FROM
-                        filings f
-                    JOIN
-                        companies c ON f.company_id = c.company_id
-                    WHERE f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
-                )
-                SELECT
-                    accession_number,
-                    company_id,
-                    period_of_report as reporting_period,
-                    filing_date,
-                    company_name,
-                    cik_number,
-                    filing_id,
-                    aum
-                FROM
-                    RankedFilings
-                WHERE
-                    rn = 1
-                ORDER BY
-                    filing_date DESC, accession_number DESC
-                LIMIT %s OFFSET %s;
-            """
-            db.execute(latest_filings_query, (limit, candidate_offset))
-            latest_filings = db.fetchall()
-
-            if not latest_filings:
-                break
-
-            # --- STEP 2: Filter the candidates downstream in Python ---
-            # filings_with_common_stock = []
-            common_stock_check_query = """
-                SELECT 1
-                FROM holdings h
-                JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                WHERE h.filing_id = %s AND tc.name ~*  %s
-                LIMIT 1;
-            """
-
-            # Step 2: For each filing, find its previous filing and top new holding.
-            for filing in latest_filings:
-                db.execute(
-                    common_stock_check_query,
-                    (filing["filing_id"], COMMON_STOCK_TITLE_OF_CLASS),
-                )
-                if not db.fetchone():
-                    continue
-
-                if valid_stories_skipped < offset:
-                    valid_stories_skipped += 1
-                    continue
-                # Find the immediate previous filing for the same company
-                previous_filing_query = """
-                    SELECT filing_id, accession_number
-                    FROM (
-                        SELECT
-                            filing_id,
-                            accession_number,
-                            period_of_report,
-                            ROW_NUMBER() OVER(PARTITION BY period_of_report ORDER BY filing_date DESC, accession_number DESC) as rn
-                        FROM filings
-                        WHERE company_id = %s AND period_of_report < %s AND form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
-                    ) AS ranked_filings
-                    WHERE rn = 1
-                    ORDER BY period_of_report DESC
-                    LIMIT 1;
-                """
-                db.execute(
-                    previous_filing_query,
-                    (filing["company_id"], filing["reporting_period"]),
-                )
-                previous_filing = db.fetchone()
-
-                top_new = top_closed = top_increased = top_decreased = None
-                top_new_other_securities = top_closed_other_securities = None
-                top_increased_other_securities = None
-                top_decreased_other_securities = None
-
-                if previous_filing:
-                    previous_filing_id = previous_filing["filing_id"]
-                    current_filing_id = filing["filing_id"]
-
-                    # This query finds holdings in the current filing that are NOT in the previous one,
-                    # orders them by value, and takes the top one.
-
-                    # Top New Position
-                    db.execute(
-                        """
-                        WITH LatestHoldingsAgg AS (
-                            SELECT 
-                                i.cusip, 
-                                MIN(i.issuer_name) as issuer_name, 
-                                SUM(h.shares_or_principal_amount) as total_shares, 
-                                SUM(h.value) as total_value
-                            FROM holdings h 
-                            JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s 
-                            GROUP BY i.cusip
-                        ),
-                        PreviousCusips AS (
-                            SELECT DISTINCT i.cusip 
-                            FROM holdings h 
-                            JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            WHERE h.filing_id = %s
-                        )
-                        SELECT 
-                            latest.issuer_name, 
-                            latest.cusip, 
-                            latest.total_shares AS shares_or_principal_amount, 
-                            latest.total_value AS value,
-                            CASE
-                                WHEN latest.total_shares > 0 THEN (CAST(latest.total_value AS NUMERIC)) / latest.total_shares
-                                ELSE 0
-                            END AS price_per_share
-                        FROM LatestHoldingsAgg latest
-                        LEFT JOIN PreviousCusips prev ON latest.cusip = prev.cusip
-                        WHERE prev.cusip IS NULL
-                        ORDER BY latest.total_value DESC LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                        ),
-                    )
-                    new_pos = db.fetchone()
-                    if new_pos:
-                        top_new = SignificantHolding(**new_pos, change_type="new")
-
-                    # Top New Position (Other Securities)
-                    db.execute(
-                        """
-                        WITH LatestHoldingsAgg AS (
-                            SELECT
-                                i.cusip,
-                                MIN(i.issuer_name) as issuer_name,
-                                SUM(h.shares_or_principal_amount) as total_shares,
-                                SUM(h.value) as total_value
-                            FROM holdings h
-                            JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                            GROUP BY i.cusip
-                        ),
-                        PreviousCusips AS (
-                            SELECT DISTINCT i.cusip
-                            FROM holdings h
-                            JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                        )
-                        SELECT
-                            latest.issuer_name,
-                            latest.cusip,
-                            latest.total_shares AS shares_or_principal_amount,
-                            latest.total_value AS value,
-                            CASE
-                                WHEN latest.total_shares > 0 THEN (CAST(latest.total_value AS NUMERIC)) / latest.total_shares
-                                ELSE 0
-                            END AS price_per_share
-                        FROM LatestHoldingsAgg latest
-                        LEFT JOIN PreviousCusips prev ON latest.cusip = prev.cusip
-                        WHERE prev.cusip IS NULL
-                        ORDER BY latest.total_value DESC LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    new_pos_other_securities = db.fetchone()
-
-                    if new_pos_other_securities:
-                        top_new_other_securities = SignificantHolding(
-                            **new_pos_other_securities, change_type="new"
-                        )
-
-                    # Top Closed Position
-                    db.execute(
-                        """
-                        WITH PreviousHoldingsAgg AS (
-                            SELECT 
-                                i.cusip, 
-                                MIN(i.issuer_name) as issuer_name, 
-                                SUM(h.shares_or_principal_amount) as total_shares, 
-                                SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s 
-                            GROUP BY i.cusip
-                        ),
-                        LatestCusips AS (
-                            SELECT DISTINCT i.cusip 
-                            FROM holdings h 
-                            JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            WHERE h.filing_id = %s
-                        )
-                        SELECT 
-                            prev.issuer_name, 
-                            prev.cusip, 
-                            prev.total_shares AS shares_or_principal_amount, 
-                            prev.total_value AS value,
-                            CASE
-                                WHEN prev.total_shares > 0 THEN (CAST(prev.total_value AS NUMERIC)) / prev.total_shares
-                                ELSE 0
-                            END AS price_per_share
-                        FROM PreviousHoldingsAgg prev
-                        LEFT JOIN LatestCusips latest ON prev.cusip = latest.cusip
-                        WHERE latest.cusip IS NULL
-                        ORDER BY prev.total_value DESC LIMIT 1;
-                        """,
-                        (
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            current_filing_id,
-                        ),
-                    )
-                    closed_pos = db.fetchone()
-                    if closed_pos:
-                        top_closed = SignificantHolding(
-                            **closed_pos, change_type="closed"
-                        )
-
-                    # Top Closed Position (Other Securities)
-                    db.execute(
-                        """
-                        WITH PreviousHoldingsAgg AS (
-                            SELECT
-                                i.cusip,
-                                MIN(i.issuer_name) as issuer_name,
-                                SUM(h.shares_or_principal_amount) as total_shares,
-                                SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                            GROUP BY i.cusip
-                        ),
-                        LatestCusips AS (
-                            SELECT DISTINCT i.cusip
-                            FROM holdings h
-                            JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                        )
-                        SELECT
-                            prev.issuer_name,
-                            prev.cusip,
-                            prev.total_shares AS shares_or_principal_amount,
-                            prev.total_value AS value,
-                            CASE
-                                WHEN prev.total_shares > 0 THEN (CAST(prev.total_value AS NUMERIC)) / prev.total_shares
-                                ELSE 0
-                            END AS price_per_share
-                        FROM PreviousHoldingsAgg prev
-                        LEFT JOIN LatestCusips latest ON prev.cusip = latest.cusip
-                        WHERE latest.cusip IS NULL
-                        ORDER BY prev.total_value DESC LIMIT 1;
-                        """,
-                        (
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    closed_pos_other_securities = db.fetchone()
-                    if closed_pos_other_securities:
-                        top_closed_other_securities = SignificantHolding(
-                            **closed_pos_other_securities, change_type="closed"
-                        )
-
-                    # Base CTE for Increased/Decreased comparison
-                    holdings_comparison_cte = """
-                        WITH LatestHoldingsAgg AS (
-                            SELECT 
-                                i.cusip, 
-                                MIN(i.issuer_name) as issuer_name, 
-                                SUM(h.shares_or_principal_amount) as total_shares,
-                                SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s 
-                            GROUP BY i.cusip
-                        ),
-                        PreviousHoldingsAgg AS (
-                            SELECT 
-                                i.cusip, 
-                                SUM(h.shares_or_principal_amount) as total_shares
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id 
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name ~* %s 
-                            GROUP BY i.cusip
-                        )
-                    """
-                    # Top Increased Position
-                    db.execute(
-                        holdings_comparison_cte
-                        + """
-                        SELECT 
-                            latest.issuer_name, 
-                            latest.cusip, latest.total_shares AS shares_or_principal_amount,
-                            (latest.total_shares - prev.total_shares) AS change_in_share,
-                            CASE 
-                                WHEN prev.total_shares > 0 
-                                THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) 
-                                ELSE NULL 
-                            END AS percent_change,
-                            CASE 
-                                WHEN latest.total_shares > 0 
-                                THEN (latest.total_value::numeric) / latest.total_shares
-                                ELSE 0 
-                            END AS price_per_share
-                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
-                        WHERE latest.total_shares > prev.total_shares
-                        ORDER BY percent_change DESC NULLS LAST LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    increased_pos = db.fetchone()
-                    if increased_pos:
-                        top_increased = HoldingChange(
-                            **increased_pos, change_type="increased"
-                        )
-
-                    # Top Decreased Position
-                    db.execute(
-                        holdings_comparison_cte
-                        + """
-                        SELECT 
-                            latest.issuer_name, 
-                            latest.cusip, 
-                            latest.total_shares AS shares_or_principal_amount,
-                            (latest.total_shares - prev.total_shares) AS change_in_share,
-                            CASE 
-                                WHEN prev.total_shares > 0 
-                                THEN ROUND(((latest.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100, 2) 
-                                ELSE NULL 
-                            END AS percent_change,
-                            CASE 
-                                WHEN latest.total_shares > 0 
-                                THEN (latest.total_value::numeric) / latest.total_shares
-                                ELSE 0 
-                            END AS price_per_share
-                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
-                        WHERE latest.total_shares < prev.total_shares
-                        ORDER BY percent_change ASC NULLS LAST LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    decreased_pos = db.fetchone()
-                    if decreased_pos:
-                        top_decreased = HoldingChange(
-                            **decreased_pos, change_type="decreased"
-                        )
-
-                    # Base CTE for Increased/Decreased comparison
-                    other_securities_holdings_comparison_cte = """
-                        WITH LatestHoldingsAgg AS (
-                            SELECT
-                                i.cusip,
-                                MIN(i.issuer_name) as issuer_name,
-                                SUM(h.shares_or_principal_amount) as total_units,
-                                SUM(h.value) as total_value
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                            GROUP BY i.cusip
-                        ),
-                        PreviousHoldingsAgg AS (
-                            SELECT
-                                i.cusip,
-                                SUM(h.shares_or_principal_amount) as total_units
-                            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
-                            JOIN title_of_class_table tc ON h.title_of_class = tc.id
-                            WHERE h.filing_id = %s AND tc.name !~* %s
-                            GROUP BY i.cusip
-                        )
-                    """
-
-                    # Top Increased Position (Other Securities)
-                    db.execute(  # TODO: verify if x1000 is needed
-                        other_securities_holdings_comparison_cte
-                        + """
-                        SELECT
-                            latest.issuer_name,
-                            latest.cusip,
-                            latest.total_units AS shares_or_principal_amount,
-                            (latest.total_units - prev.total_units) AS change_in_share,
-                            CASE
-                                WHEN prev.total_units > 0
-                                THEN ROUND(((latest.total_units - prev.total_units)::numeric / prev.total_units) * 100, 2)
-                                ELSE NULL
-                            END AS percent_change,
-                            CASE
-                                WHEN latest.total_units > 0
-                                THEN (latest.total_value::numeric * 1000) / latest.total_units
-                                ELSE 0
-                            END AS price_per_unit
-                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
-                        WHERE latest.total_units > prev.total_units
-                        ORDER BY percent_change DESC NULLS LAST LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    increased_pos_other_securities = db.fetchone()
-                    if increased_pos_other_securities:
-                        top_increased_other_securities = HoldingChange(
-                            **increased_pos_other_securities, change_type="increased"
-                        )
-
-                    # Top Decreased Position
-                    db.execute(
-                        other_securities_holdings_comparison_cte
-                        + """
-                        SELECT 
-                            latest.issuer_name, 
-                            latest.cusip, 
-                            latest.total_units AS shares_or_principal_amount,
-                            (latest.total_units - prev.total_units) AS change_in_share,
-                            CASE 
-                                WHEN prev.total_units > 0 
-                                THEN ROUND(((latest.total_units - prev.total_units)::numeric / prev.total_units) * 100, 2) 
-                                ELSE NULL 
-                            END AS percent_change,
-                            CASE 
-                                WHEN latest.total_units > 0 
-                                THEN (latest.total_value::numeric) / latest.total_units
-                                ELSE 0 
-                            END AS price_per_unit
-                        FROM LatestHoldingsAgg latest JOIN PreviousHoldingsAgg prev ON latest.cusip = prev.cusip
-                        WHERE latest.total_units < prev.total_units
-                        ORDER BY percent_change ASC NULLS LAST LIMIT 1;
-                        """,
-                        (
-                            current_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                            previous_filing_id,
-                            COMMON_STOCK_TITLE_OF_CLASS,
-                        ),
-                    )
-                    decreased_pos_other_securities = db.fetchone()
-                    if decreased_pos_other_securities:
-                        top_decreased_other_securities = HoldingChange(
-                            **decreased_pos_other_securities, change_type="decreased"
-                        )
-
-                story_summaries.append(
-                    StorySummary(
-                        cik=filing["cik_number"],
-                        aum=filing["aum"],
-                        latest_accession_number=filing["accession_number"],
-                        previous_accession_number=previous_filing["accession_number"],
-                        company_name=filing["company_name"],
-                        reporting_period=filing["reporting_period"],
-                        filing_date=filing["filing_date"],
-                        # Common Stock
-                        top_new_position=top_new,
-                        top_closed_position=top_closed,
-                        top_increased_position=top_increased,
-                        top_decreased_position=top_decreased,
-                        # Other Securities
-                        top_new_other_securities=top_new_other_securities,
-                        top_closed_other_securities=top_closed_other_securities,
-                        top_increased_other_securities=top_increased_other_securities,
-                        top_decreased_other_securities=top_decreased_other_securities,
-                    )
-                )
-
-                if len(story_summaries) >= limit:
-                    break
-
-            # Prepare for the next iteration
-            candidate_offset += CANDIDATE_BATCH_SIZE
-            if len(story_summaries) >= limit:
-                break
-
-        return LatestStoriesResponse(stories=story_summaries)
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"An internal error occurred: {str(e)}"
-        )
-
-
 FILING_QUERY_V2 = """
 WITH RankedFilings AS (
     SELECT
@@ -2520,49 +1985,6 @@ async def get_latest_stories_v2(
         )
 
 
-class HoldingActivity(BaseModel):
-    """Represents a single change (one 'headline') from a filing."""
-
-    # Company Info
-    cik: str
-    company_name: str
-    aum: Optional[int] = None
-
-    # Filing Info
-    latest_accession_number: str
-    previous_accession_number: Optional[str] = None
-    reporting_period: dt.date
-    filing_date: dt.date
-
-    # Stock/Holding Info
-    issuer_name: str
-    cusip: str
-    is_common_stock: bool
-
-    # Change Info
-    change_type: str  # 'new', 'closed', 'increased', 'decreased'
-    current_shares: Optional[int] = None
-    previous_shares: Optional[int] = None
-    change_in_share: Optional[int] = None
-    percent_change: Optional[float] = None
-
-    # Value Info
-    current_value: Optional[int] = None
-    previous_value: Optional[int] = None
-    absolute_value_change: int
-
-    # --- ADD THESE TWO LINES ---
-    current_price_per_share: Optional[float] = None
-    previous_price_per_share: Optional[float] = None
-
-
-class LatestActivityResponse(BaseModel):
-    """The response for the latest activity/headline list endpoint."""
-
-    activities: List[HoldingActivity]
-    has_next_page: bool = False
-
-
 LATEST_ACTIVITY_QUERY_V3 = """
     WITH FilingsWithPrevious AS (
         SELECT * FROM (VALUES %s) AS t (
@@ -2818,6 +2240,126 @@ def search_companies(
         return companies
     except Exception as e:
         raise HTTPException(status_code=500, detail="Error during company search")
+
+
+# @app.get("/api/flow/{cusip}", response_model=List[FlowAnalysisResponse])
+# def get_institutional_flow(
+#     cusip: str,
+#     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+# ):
+#     """
+#     Calculates the aggregate Institutional Gross Buying and Selling pressure
+#     for a specific CUSIP over time.
+#     """
+#     try:
+#         # 1. SQL QUERY: Get the raw "Long" format data
+#         # We filter for 'NONE' in put_or_call to ensure we are looking at long stock positions,
+#         # not options.
+#         query = """
+#             SELECT
+#                 c.cik_number,
+#                 c.company_name,
+#                 f.period_of_report,
+#                 h.shares_or_principal_amount as shares,
+#                 h.value
+#             FROM holdings h
+#             JOIN filings f ON h.filing_id = f.filing_id
+#             JOIN companies c ON f.company_id = c.company_id
+#             JOIN issuers i ON h.issuer_id = i.issuer_id
+#             LEFT JOIN put_or_call_table pc ON h.put_or_call = pc.id
+#             WHERE i.cusip = %s
+#             AND (pc.name IS NULL OR pc.name = 'NONE')
+#             ORDER BY f.period_of_report ASC;
+#         """
+
+#         db.execute(query, (cusip,))
+#         rows = db.fetchall()
+
+#         if not rows:
+#             return []
+
+#         # 2. LOAD INTO PANDAS
+#         # We use Pandas here because pivot_table and time-series diffing
+#         # is significantly more concise than raw Python loops.
+#         df = pd.DataFrame(rows)
+
+#         # Ensure period is datetime
+#         df["period_of_report"] = pd.to_datetime(df["period_of_report"])
+
+#         # Calculate an estimated price per share for that quarter (Aggregate Value / Aggregate Shares)
+#         # We do this before pivoting to get a "Reference Price" for the chart
+#         price_df = df.groupby("period_of_report")[["value", "shares"]].sum()
+#         price_df["price_estimate"] = price_df["value"] / price_df["shares"]
+#         # Handle the x1000 multiplier rule if price is suspiciously low (< $1.00 usually means value was in thousands)
+#         # (This is a simplified heuristic; for production, apply per-row logic)
+#         price_df["price_estimate"] = price_df.apply(
+#             lambda x: (
+#                 x["price_estimate"] * 1000
+#                 if x["price_estimate"] < 1.0
+#                 else x["price_estimate"]
+#             ),
+#             axis=1,
+#         )
+
+#         # 3. DEDUPLICATE (The "Latest Wins" Logic)
+#         # If a fund filed multiple times for the same period (Amendment), keep the last one.
+#         df = df.sort_values(["cik_number", "period_of_report"])
+#         df = df.drop_duplicates(["cik_number", "period_of_report"], keep="last")
+
+#         # 4. PIVOT (Rows=Dates, Cols=Funds, Values=Shares)
+#         pivot_df = df.pivot(
+#             index="period_of_report", columns="company_name", values="shares"
+#         )
+
+#         # 5. FILL GAPS & DIFF
+#         # fillna(0) ensures that if a fund appears for the first time, it counts as a BUY (0 -> X).
+#         # It also ensures if a fund disappears, it counts as a SELL (X -> 0).
+#         pivot_df = pivot_df.fillna(0)
+#         diff_df = pivot_df.diff()
+
+#         # 6. CALCULATE AGGREGATES
+#         # Sum only the positive changes for Buying
+#         gross_buying = diff_df[diff_df > 0].sum(axis=1)
+#         # Sum only the negative changes for Selling (abs() to make it positive for charting)
+#         gross_selling = diff_df[diff_df < 0].sum(axis=1).abs()
+
+#         # 7. FORMAT RESPONSE
+#         results = []
+#         for date, buy_val in gross_buying.items():
+#             sell_val = gross_selling[date]
+
+#             # Skip the very first row if it's all NaN/Zeros due to diff()
+#             # (unless fillna(0) made the first row appear as a massive buy,
+#             # which we might want to skip for chart clarity, but here we include it)
+#             if pd.isna(buy_val) and pd.isna(sell_val):
+#                 continue
+
+#             est_price = (
+#                 price_df.loc[date, "price_estimate"] if date in price_df.index else None
+#             )
+
+#             results.append(
+#                 {
+#                     "period": date.date(),
+#                     "gross_buying": float(buy_val),
+#                     "gross_selling": float(sell_val),
+#                     "net_flow": float(buy_val - sell_val),
+#                     "share_price_estimate": (
+#                         float(est_price) if not pd.isna(est_price) else None
+#                     ),
+#                 }
+#             )
+
+#         # Remove the very first entry if it represents the "Big Bang" (initialization)
+#         # Usually, the first date shows massive buying because 0 -> X.
+#         # Most charts prefer to drop the first data point of the diff.
+#         if results:
+#             results.pop(0)
+
+#         return results
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error calculating flow: {str(e)}")
 
 
 if __name__ == "__main__":
