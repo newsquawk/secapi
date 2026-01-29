@@ -79,13 +79,13 @@ class LatestActivityResponse(BaseModel):
     has_next_page: bool = False
 
 
-class FlowAnalysisResponse(BaseModel):
-    """
-    For CUSIP net aggregate analysis
-    """
-
-    period: date
+class FlowPoint(BaseModel):
+    date: str
     gross_buying: float
     gross_selling: float
-    net_flow: float
-    share_price_estimate: float | None = None
+    net_change: float
+
+
+class FlowResponse(BaseModel):
+    cusip: str
+    history: List[FlowPoint]

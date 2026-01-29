@@ -16,7 +16,7 @@ import pandas as pd
 
 from sec_models import (
     Filing,
-    FlowAnalysisResponse,
+    FlowResponse,
     LatestActivityResponse,
     HoldingActivity,
 )
@@ -1147,6 +1147,7 @@ async def compare_holdings(
             "total_value_latest",
             "per_share_price_latest",
             "put_or_call",
+            "cusip",
         )
         closed_positions = merged_df.filter(
             pl.col("total_shares_latest").is_null()
@@ -1156,6 +1157,7 @@ async def compare_holdings(
             "total_value_prev",
             "per_share_price_prev",
             "put_or_call",
+            "cusip_prev",
         )
         new_other_holdings = merged_other_df.filter(
             pl.col("total_units_prev").is_null()
@@ -1213,6 +1215,7 @@ async def compare_holdings(
                 "change_in_share",
                 "percent_change",
                 "put_or_call",
+                "cusip",
             )
         )
 
@@ -2274,124 +2277,136 @@ def search_companies(
         raise HTTPException(status_code=500, detail="Error during company search")
 
 
-# @app.get("/api/flow/{cusip}", response_model=List[FlowAnalysisResponse])
-# def get_institutional_flow(
-#     cusip: str,
-#     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
-# ):
-#     """
-#     Calculates the aggregate Institutional Gross Buying and Selling pressure
-#     for a specific CUSIP over time.
-#     """
-#     try:
-#         # 1. SQL QUERY: Get the raw "Long" format data
-#         # We filter for 'NONE' in put_or_call to ensure we are looking at long stock positions,
-#         # not options.
-#         query = """
-#             SELECT
-#                 c.cik_number,
-#                 c.company_name,
-#                 f.period_of_report,
-#                 h.shares_or_principal_amount as shares,
-#                 h.value
-#             FROM holdings h
-#             JOIN filings f ON h.filing_id = f.filing_id
-#             JOIN companies c ON f.company_id = c.company_id
-#             JOIN issuers i ON h.issuer_id = i.issuer_id
-#             LEFT JOIN put_or_call_table pc ON h.put_or_call = pc.id
-#             WHERE i.cusip = %s
-#             AND (pc.name IS NULL OR pc.name = 'NONE')
-#             ORDER BY f.period_of_report ASC;
-#         """
+def fetch_clean_holdings_df(
+    cursor,
+    target_cusip: str,
+    start_date: Optional[dt.date] = None,
+) -> pd.DataFrame:
+    """
+    Fetches historical holdings for a CUSIP, filtering for the
+    latest filing per quarter to handle amendments.
+    """
+    base_query = """
+        WITH latest_filings_filter AS (
+            SELECT filing_id, company_id, period_of_report
+            FROM (
+                SELECT 
+                    filing_id, company_id, period_of_report,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY company_id, period_of_report 
+                        ORDER BY filing_date DESC, accession_number DESC
+                    ) as rn
+                FROM filings
+            ) sub
+            WHERE rn = 1
+        )
+        SELECT 
+            c.cik_number,
+            lf.period_of_report as period,
+            SUM(h.shares_or_principal_amount) as shares
+        FROM holdings h
+        JOIN latest_filings_filter lf ON h.filing_id = lf.filing_id
+        JOIN companies c ON lf.company_id = c.company_id
+        JOIN issuers i ON h.issuer_id = i.issuer_id
+        LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
+        WHERE 
+            i.cusip = %s
+            AND (poc.name = 'NONE' OR poc.name IS NULL)
+        """
 
-#         db.execute(query, (cusip,))
-#         rows = db.fetchall()
+    # Dynamic SQL parameter construction
+    params = [target_cusip]
 
-#         if not rows:
-#             return []
+    if start_date:
+        base_query += " AND lf.period_of_report >= %s"
+        params.append(start_date)
 
-#         # 2. LOAD INTO PANDAS
-#         # We use Pandas here because pivot_table and time-series diffing
-#         # is significantly more concise than raw Python loops.
-#         df = pd.DataFrame(rows)
+    # Add Group By and Order By at the end
+    base_query += """
+        GROUP BY c.cik_number, lf.period_of_report
+        ORDER BY lf.period_of_report ASC
+    """
 
-#         # Ensure period is datetime
-#         df["period_of_report"] = pd.to_datetime(df["period_of_report"])
+    # Execute query
+    cursor.execute(base_query, tuple(params))
+    results = cursor.fetchall()
 
-#         # Calculate an estimated price per share for that quarter (Aggregate Value / Aggregate Shares)
-#         # We do this before pivoting to get a "Reference Price" for the chart
-#         price_df = df.groupby("period_of_report")[["value", "shares"]].sum()
-#         price_df["price_estimate"] = price_df["value"] / price_df["shares"]
-#         # Handle the x1000 multiplier rule if price is suspiciously low (< $1.00 usually means value was in thousands)
-#         # (This is a simplified heuristic; for production, apply per-row logic)
-#         price_df["price_estimate"] = price_df.apply(
-#             lambda x: (
-#                 x["price_estimate"] * 1000
-#                 if x["price_estimate"] < 1.0
-#                 else x["price_estimate"]
-#             ),
-#             axis=1,
-#         )
+    if not results:
+        return pd.DataFrame()
 
-#         # 3. DEDUPLICATE (The "Latest Wins" Logic)
-#         # If a fund filed multiple times for the same period (Amendment), keep the last one.
-#         df = df.sort_values(["cik_number", "period_of_report"])
-#         df = df.drop_duplicates(["cik_number", "period_of_report"], keep="last")
+    return pd.DataFrame(results)
 
-#         # 4. PIVOT (Rows=Dates, Cols=Funds, Values=Shares)
-#         pivot_df = df.pivot(
-#             index="period_of_report", columns="company_name", values="shares"
-#         )
 
-#         # 5. FILL GAPS & DIFF
-#         # fillna(0) ensures that if a fund appears for the first time, it counts as a BUY (0 -> X).
-#         # It also ensures if a fund disappears, it counts as a SELL (X -> 0).
-#         pivot_df = pivot_df.fillna(0)
-#         diff_df = pivot_df.diff()
+@app.get("/api/v1/flow/{cusip}", response_model=FlowResponse)
+def get_stock_flow(
+    cusip: str,
+    years: Optional[int] = Query(
+        None, description="Limit analysis to the past X years"
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Calculates the net buying/selling flow for a specific CUSIP.
+    """
 
-#         # 6. CALCULATE AGGREGATES
-#         # Sum only the positive changes for Buying
-#         gross_buying = diff_df[diff_df > 0].sum(axis=1)
-#         # Sum only the negative changes for Selling (abs() to make it positive for charting)
-#         gross_selling = diff_df[diff_df < 0].sum(axis=1).abs()
+    try:
+        # 1. Get Clean Data directly using CUSIP
+        # Note: We strip whitespace to be safe
+        clean_cusip = cusip.strip()
 
-#         # 7. FORMAT RESPONSE
-#         results = []
-#         for date, buy_val in gross_buying.items():
-#             sell_val = gross_selling[date]
+        start_date = None
+        if years:
+            # Get today's date minus X years
+            start_date = dt.date.today() - dt.timedelta(days=365 * years)
 
-#             # Skip the very first row if it's all NaN/Zeros due to diff()
-#             # (unless fillna(0) made the first row appear as a massive buy,
-#             # which we might want to skip for chart clarity, but here we include it)
-#             if pd.isna(buy_val) and pd.isna(sell_val):
-#                 continue
+        df = fetch_clean_holdings_df(db, clean_cusip, start_date=start_date)
 
-#             est_price = (
-#                 price_df.loc[date, "price_estimate"] if date in price_df.index else None
-#             )
+        # 2. Handle Empty Case (No data found for this CUSIP)
+        if df.empty:
+            return {"cusip": clean_cusip, "history": []}
 
-#             results.append(
-#                 {
-#                     "period": date.date(),
-#                     "gross_buying": float(buy_val),
-#                     "gross_selling": float(sell_val),
-#                     "net_flow": float(buy_val - sell_val),
-#                     "share_price_estimate": (
-#                         float(est_price) if not pd.isna(est_price) else None
-#                     ),
-#                 }
-#             )
+        # 3. The "Pandas Magic" (Pivot -> Fill -> Diff)
+        df["period"] = pd.to_datetime(df["period"])
 
-#         # Remove the very first entry if it represents the "Big Bang" (initialization)
-#         # Usually, the first date shows massive buying because 0 -> X.
-#         # Most charts prefer to drop the first data point of the diff.
-#         if results:
-#             results.pop(0)
+        # Pivot: Rows=Date, Cols=Fund CIK
+        pivot_df = df.pivot(index="period", columns="cik_number", values="shares")
 
-#         return results
+        # CRITICAL: Fill missing with 0 so "Sold Out" and "New Buy" are captured
+        pivot_df = pivot_df.fillna(0)
 
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error calculating flow: {str(e)}")
+        # Calculate Quarter-over-Quarter change
+        change_df = pivot_df.diff()
+
+        # 4. Aggregate Totals
+        analysis_df = pd.DataFrame(index=change_df.index)
+        analysis_df["gross_buying"] = change_df[change_df > 0].sum(axis=1)
+        analysis_df["gross_selling"] = change_df[change_df < 0].sum(axis=1).abs()
+        analysis_df["net_change"] = (
+            analysis_df["gross_buying"] - analysis_df["gross_selling"]
+        )
+
+        # Drop the first row (invalid diff)
+        analysis_df = analysis_df.iloc[1:]
+
+        # 5. Format for JSON
+        history = []
+        for date, row in analysis_df.iterrows():
+            history.append(
+                {
+                    "date": date.strftime("%Y-%m-%d"),
+                    "gross_buying": float(row["gross_buying"]),
+                    "gross_selling": float(row["gross_selling"]),
+                    "net_change": float(row["net_change"]),
+                }
+            )
+
+        return {"cusip": clean_cusip, "history": history}
+
+    except Exception as e:
+        print(f"Error processing CUSIP {cusip}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
