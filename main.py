@@ -19,6 +19,8 @@ from sec_models import (
     FlowResponse,
     LatestActivityResponse,
     HoldingActivity,
+    DailyFlowEntry,
+    DailyFlowResponse,
 )
 from sic import SIC_MAPPING
 
@@ -2407,6 +2409,107 @@ def get_stock_flow(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+@app.get("/api/v1/flow/daily/{cusip}", response_model=DailyFlowResponse)
+def get_daily_stock_flow(
+    cusip: str,
+    days: int = Query(1, description="Number of days to look back", ge=1, le=365),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Aggregates buying/selling flow based on the FILING DATE.
+    This shows 'what was reported today' rather than 'what happened in Q3'.
+    """
+    clean_cusip = cusip.strip()
+    start_date = dt.date.today() - dt.timedelta(days=days)
+
+    query = """
+    WITH RelevantFilings AS (
+        -- 1. Identify all 13F filings submitted in the requested date range
+        SELECT
+            f.filing_id,
+            f.company_id,
+            f.filing_date,
+            f.period_of_report
+        FROM filings f
+        WHERE f.filing_date >= %s
+          AND f.form_type IN ('13F-HR', '13F-HR/A')
+    ),
+    PreviousFilings AS (
+        -- 2. For each relevant filing, find the fund's immediately preceding filing
+        --    This serves as the 'baseline' to calculate the change.
+        SELECT
+            rf.filing_id AS current_filing_id,
+            (
+                SELECT f2.filing_id
+                FROM filings f2
+                WHERE f2.company_id = rf.company_id
+                  AND f2.period_of_report < rf.period_of_report
+                  AND f2.form_type IN ('13F-HR', '13F-HR/A')
+                ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
+                LIMIT 1
+            ) AS previous_filing_id
+        FROM RelevantFilings rf
+    ),
+    HoldingsComparison AS (
+        -- 3. Calculate the delta for the specific CUSIP between Current and Previous
+        SELECT
+            rf.filing_date,
+            COALESCE(h_curr.shares_or_principal_amount, 0) as current_shares,
+            COALESCE(h_prev.shares_or_principal_amount, 0) as previous_shares
+        FROM RelevantFilings rf
+        JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
+        -- Join Current Holdings (Left Join to capture 'Sold Out' if needed, though filtered below)
+        LEFT JOIN (
+            SELECT h.filing_id, h.shares_or_principal_amount
+            FROM holdings h
+            JOIN issuers i ON h.issuer_id = i.issuer_id
+            WHERE i.cusip = %s 
+        ) h_curr ON rf.filing_id = h_curr.filing_id
+        -- Join Previous Holdings
+        LEFT JOIN (
+            SELECT h.filing_id, h.shares_or_principal_amount
+            FROM holdings h
+            JOIN issuers i ON h.issuer_id = i.issuer_id
+            WHERE i.cusip = %s
+        ) h_prev ON pf.previous_filing_id = h_prev.filing_id
+        -- Filter: Only keep rows where the stock exists in at least one of the filings
+        -- This captures Buys (exists in Curr) and Sells (exists in Prev but not Curr)
+        WHERE h_curr.shares_or_principal_amount IS NOT NULL
+           OR h_prev.shares_or_principal_amount IS NOT NULL
+    )
+    -- 4. Group by Filing Date to get the daily aggregate
+    SELECT
+        filing_date,
+        SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END) as gross_buying,
+        SUM(CASE WHEN current_shares < previous_shares THEN ABS(current_shares - previous_shares) ELSE 0 END) as gross_selling,
+        SUM(current_shares - previous_shares) as net_change
+    FROM HoldingsComparison
+    GROUP BY filing_date
+    ORDER BY filing_date DESC;
+    """
+
+    try:
+        # Pass params: start_date, then cusip twice (for current and prev join)
+        db.execute(query, (start_date, clean_cusip, clean_cusip))
+        results = db.fetchall()
+
+        daily_data = [
+            DailyFlowEntry(
+                date=row["filing_date"],
+                gross_buying=float(row["gross_buying"]),
+                gross_selling=float(row["gross_selling"]),
+                net_change=float(row["net_change"]),
+            )
+            for row in results
+        ]
+
+        return DailyFlowResponse(cusip=clean_cusip, daily_data=daily_data)
+
+    except Exception as e:
+        # Log error in production
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 if __name__ == "__main__":

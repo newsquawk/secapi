@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from datetime import date, datetime
+import datetime as dt
 from typing import Optional
 from typing import List
 
@@ -11,12 +11,12 @@ class Filing(BaseModel):
 
     accession_number: str
     form_type: str
-    filing_date: date
-    period_of_report: date
+    filing_date: dt.date
+    period_of_report: dt.date
     file_number: Optional[str] = None
     filing_directory: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: dt.datetime
+    updated_at: dt.datetime
 
 
 class Holding(BaseModel):
@@ -47,8 +47,8 @@ class HoldingActivity(BaseModel):
     # Filing Info
     latest_accession_number: str
     previous_accession_number: Optional[str] = None
-    reporting_period: date
-    filing_date: date
+    reporting_period: dt.date
+    filing_date: dt.date
 
     # Stock/Holding Info
     issuer_name: str
@@ -89,3 +89,15 @@ class FlowPoint(BaseModel):
 class FlowResponse(BaseModel):
     cusip: str
     history: List[FlowPoint]
+
+
+class DailyFlowEntry(BaseModel):
+    date: dt.date
+    gross_buying: float
+    gross_selling: float
+    net_change: float
+
+
+class DailyFlowResponse(BaseModel):
+    cusip: str
+    daily_data: List[DailyFlowEntry]
