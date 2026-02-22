@@ -99,5 +99,6 @@ class DailyFlowEntry(BaseModel):
 
 
 class DailyFlowResponse(BaseModel):
+    ticker: Optional[str] = None
     cusip: str
     daily_data: List[DailyFlowEntry]

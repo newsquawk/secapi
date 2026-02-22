@@ -8,7 +8,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py sec_models.py sic.py /app/
+COPY main.py sec_models.py sic.py ticker_cusip_mapping.csv /app/
 
 ENV FLASK_APP=main.py
 ENV FLASK_ENV=production

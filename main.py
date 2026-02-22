@@ -38,6 +38,14 @@ DEFINED_SCHEMA = {
     "accession_no": pl.String,
 }
 
+TICKER_TO_CUSIP = {}
+try:
+    mapping_df = pd.read_csv("ticker_cusip_mapping.csv")
+    # Convert tickers to uppercase for case-insensitive lookup, and map to CUSIP
+    TICKER_TO_CUSIP = dict(zip(mapping_df["ticker"].str.upper(), mapping_df["cusip"]))
+except Exception as e:
+    print(f"Warning: Could not load ticker_cusip_mapping.csv: {e}")
+
 ### FastAPI app setup ###
 app = FastAPI(title="SEC API", version="1.0.0", debug=True)
 
@@ -2339,7 +2347,7 @@ def fetch_clean_holdings_df(
     return pd.DataFrame(results)
 
 
-@app.get("/api/v1/flow/{cusip}", response_model=FlowResponse)
+# @app.get("/api/v1/flow/{cusip}", response_model=FlowResponse)
 def get_stock_flow(
     cusip: str,
     years: Optional[int] = Query(
@@ -2349,6 +2357,7 @@ def get_stock_flow(
 ):
     """
     Calculates the net buying/selling flow for a specific CUSIP.
+    Aggregated over period of report (quarterly)
     """
 
     try:
@@ -2411,9 +2420,9 @@ def get_stock_flow(
         db.close()
 
 
-@app.get("/api/v1/flow/daily/{cusip}", response_model=DailyFlowResponse)
+@app.get("/api/v1/flow/daily/{identifier}", response_model=DailyFlowResponse)
 def get_daily_stock_flow(
-    cusip: str,
+    identifier: str,
     days: int = Query(1, description="Number of days to look back", ge=1, le=365),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -2421,7 +2430,23 @@ def get_daily_stock_flow(
     Aggregates buying/selling flow based on the FILING DATE.
     This shows 'what was reported today' rather than 'what happened in Q3'.
     """
-    clean_cusip = cusip.strip()
+    # Clean the input and make uppercase to match our dictionary keys
+    identifier_clean = identifier.strip().upper()
+
+    ticker = None
+    if identifier_clean in TICKER_TO_CUSIP:
+        ticker = identifier_clean
+        clean_cusip = TICKER_TO_CUSIP[identifier_clean]
+    else:
+        clean_cusip = identifier_clean
+        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
+        if clean_cusip in CUSIP_TO_TICKER:
+            ticker = CUSIP_TO_TICKER[clean_cusip]
+
+    print(
+        f"Received request for identifier: {identifier}, resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
+    )
+
     start_date = dt.date.today() - dt.timedelta(days=days)
 
     query = """
@@ -2493,6 +2518,9 @@ def get_daily_stock_flow(
     try:
         # Pass params: start_date, then cusip twice (for current and prev join)
         db.execute(query, (start_date, clean_cusip, clean_cusip))
+        print(
+            f"Executed daily flow query for CUSIP {clean_cusip} starting from {start_date}"
+        )
         results = db.fetchall()
 
         daily_data = [
@@ -2505,10 +2533,67 @@ def get_daily_stock_flow(
             for row in results
         ]
 
-        return DailyFlowResponse(cusip=clean_cusip, daily_data=daily_data)
+        return DailyFlowResponse(
+            ticker=ticker, cusip=clean_cusip, daily_data=daily_data
+        )
 
     except Exception as e:
         # Log error in production
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/v1/search/companies_by_aum", response_model=list[dict])
+def search_companies_by_aum(
+    min_aum: Optional[int] = Query(None, description="Minimum AUM"),
+    max_aum: Optional[int] = Query(None, description="Maximum AUM"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Search for companies within a specific Assets Under Management (AUM) range.
+    """
+    # Start with a base query
+    query = """
+        SELECT
+            cik_number,
+            company_name,
+            aum
+        FROM companies
+        WHERE 1=1
+    """
+    params = []
+
+    # Dynamically build the WHERE clause based on provided parameters
+    if min_aum is not None:
+        query += " AND aum >= %s"
+        params.append(min_aum)
+
+    if max_aum is not None:
+        query += " AND aum <= %s"
+        params.append(max_aum)
+
+    # Add sorting and pagination
+    query += " ORDER BY aum DESC NULLS LAST LIMIT %s OFFSET %s"
+    params.extend([limit, offset])
+
+    try:
+        # Execute the query safely to prevent SQL injection
+        db.execute(query, tuple(params))
+        results = db.fetchall()
+
+        # Format the response
+        companies = [
+            {
+                "cik": str(row["cik_number"]),
+                "company_name": row["company_name"],
+                "aum": row["aum"],
+            }
+            for row in results
+        ]
+        return companies
+
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
