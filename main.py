@@ -2597,5 +2597,130 @@ def search_companies_by_aum(
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
+@app.get("/api/v1/search/filings_by_aum", response_model=dict)
+def search_filings_by_aum(
+    min_aum: Optional[int] = Query(None, description="Minimum AUM filter"),
+    max_aum: Optional[int] = Query(None, description="Maximum AUM filter"),
+    ciks: Optional[List[str]] = Query(
+        None, description="List of company CIKs to include"
+    ),
+    limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    sort_by: str = Query(
+        "created_at",
+        description="Sort column: 'filing_date' or 'created_at' or 'period_of_report'",
+    ),
+    sort_order: str = Query("desc", description="Sort order: 'asc' or 'desc'"),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Search and filter filings based on Company AUM and specific CIKs,
+    with pagination and sorting capabilities.
+    """
+
+    # 1. Validate sorting parameters to prevent SQL injection
+    allowed_sort_columns = {
+        "filing_date": "f.filing_date",
+        "created_at": "f.created_at",
+        "period_of_report": "f.period_of_report",
+    }
+
+    if sort_by not in allowed_sort_columns:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid sort_by column. Use 'filing_date', 'created_at', or 'period_of_report'.",
+        )
+
+    if sort_order.lower() not in ["asc", "desc"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid sort_order. Use 'asc' or 'desc'."
+        )
+
+    sort_column = allowed_sort_columns[sort_by]
+    sort_dir = sort_order.upper()
+
+    # 2. Build the WHERE clause dynamically
+    where_clauses = ["1=1"]
+    params = {}
+
+    if min_aum is not None:
+        where_clauses.append("c.aum >= %(min_aum)s")
+        params["min_aum"] = min_aum
+
+    if max_aum is not None:
+        where_clauses.append("c.aum <= %(max_aum)s")
+        params["max_aum"] = max_aum
+
+    if ciks:
+        # .lstrip("0") strips all leading zeros.
+        # The 'or "0"' ensures that if someone literally inputs "0000000000",
+        # it falls back to a single "0" instead of an empty string.
+        clean_ciks = [cik.strip().lstrip("0") or "0" for cik in ciks]
+
+        where_clauses.append("c.cik_number = ANY(%(ciks)s)")
+        params["ciks"] = clean_ciks
+
+    where_sql = " AND ".join(where_clauses)
+
+    try:
+        # 3. Get total count for precise pagination metadata
+        count_query = f"""
+            SELECT COUNT(*) 
+            FROM filings f
+            JOIN companies c ON f.company_id = c.company_id
+            WHERE {where_sql}
+        """
+
+        db.execute(count_query, params)
+        total_count = db.fetchone()["count"]
+
+        if total_count == 0:
+            return {
+                "filings": [],
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "total": 0,
+                    "has_more": False,
+                },
+            }
+
+        # 4. Fetch the paginated and sorted data
+        filings_query = f"""
+            SELECT
+                f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                f.file_number, f.filing_directory, f.created_at, f.updated_at,
+                c.company_name, c.cik_number, c.aum
+            FROM filings f
+            JOIN companies c ON f.company_id = c.company_id
+            WHERE {where_sql}
+            ORDER BY {sort_column} {sort_dir}
+            LIMIT %(limit)s OFFSET %(offset)s
+        """
+
+        # Add pagination variables to the execution parameters
+        params["limit"] = limit
+        params["offset"] = offset
+
+        db.execute(filings_query, params)
+        filings_data = db.fetchall()
+
+        # Determine if there are more pages
+        has_more = (offset + len(filings_data)) < total_count
+
+        return {
+            "filings": filings_data,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": total_count,
+                "has_more": has_more,
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
