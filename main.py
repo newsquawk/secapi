@@ -46,6 +46,28 @@ try:
 except Exception as e:
     print(f"Warning: Could not load ticker_cusip_mapping.csv: {e}")
 
+CUSIP_DETAILS_DF = pl.DataFrame()
+try:
+    # We only read 'cusip' and 'sic' to minimize memory footprint
+    CUSIP_DETAILS_DF = pl.read_csv(
+        "cusip_details_filtered_fixed.csv",
+        columns=["cusip", "industry", "sic", "sicSector", "sicIndustry"],
+        schema_overrides={
+            "cusip": pl.Utf8,
+            "industry": pl.Utf8,
+            "sic": pl.Int64,
+            "sicSector": pl.Utf8,
+            "sicIndustry": pl.Utf8,
+        },
+        ignore_errors=True,
+    ).drop_nulls(subset=["cusip"])
+
+    # Ensure there are no duplicate CUSIPs mapping to multiple SICs
+    CUSIP_DETAILS_DF = CUSIP_DETAILS_DF.unique(subset=["cusip"], keep="first")
+    print(f"Loaded {CUSIP_DETAILS_DF.height} CUSIP-to-SIC mappings.")
+except Exception as e:
+    print(f"Warning: Could not load cusip_details_filtered.csv: {e}")
+
 ### FastAPI app setup ###
 app = FastAPI(title="SEC API", version="1.0.0", debug=True)
 
@@ -1094,20 +1116,27 @@ async def compare_holdings(
         merged_df = latest_aggregated.join(
             prev_aggregated, on="cusip", how="full", suffix="_prev"
         )
+        merged_other_df = latest_other_aggregated.join(
+            prev_other_aggregated, on="cusip", how="full", suffix="_prev"
+        )
+
+        # --- NEW: ENRICH WITH CSV METADATA ---
+        if not CUSIP_DETAILS_DF.is_empty():
+            # Drop the database 'sic' and 'sic_prev' so we don't get column collisions
+            if "sic" in merged_df.columns:
+                merged_df = merged_df.drop(["sic", "sic_prev"])
+
+            # Join the enriched CSV data
+            merged_df = merged_df.join(CUSIP_DETAILS_DF, on="cusip", how="left")
+            merged_other_df = merged_other_df.join(
+                CUSIP_DETAILS_DF, on="cusip", how="left"
+            )
+        # --------------------------------------
 
         #### SECTOR ANALYSIS ####
         sector_changes = (
-            merged_df.with_columns(
-                # Coalesce SIC codes, preferring the latest one
-                pl.coalesce(pl.col("sic"), pl.col("sic_prev")).alias("final_sic")
-            )
-            .filter(pl.col("final_sic").is_not_null())  # Ensure SIC code is present
-            .with_columns(
-                pl.col("final_sic")
-                .map_elements(get_sic_division, return_dtype=pl.Utf8)
-                .alias("sector"),
-            )
-            .group_by("sector")
+            merged_df.filter(pl.col("sicSector").is_not_null())
+            .group_by("sicSector")
             .agg(
                 pl.col("total_value_latest")
                 .fill_null(0)
@@ -1133,22 +1162,79 @@ async def compare_holdings(
                 .round(2)
                 .alias("percent_change")
             )
-            .filter(pl.col("percent_change").is_not_null())
         )
 
-        increased_sectors = sector_changes.filter(pl.col("percent_change") > 0).sort(
-            "percent_change", descending=True
-        )
+        increased_sectors = sector_changes.filter(
+            (pl.col("percent_change") > 0) | (pl.col("prev_sector_total") == 0)
+        ).sort("percent_change", descending=True)
 
         decreased_sectors = sector_changes.filter(pl.col("percent_change") < 0).sort(
             "percent_change", descending=False
         )
 
-        ### SECTOR ANALYSIS END ###
-
-        merged_other_df = latest_other_aggregated.join(
-            prev_other_aggregated, on="cusip", how="full", suffix="_prev"
+        # 1. Changes grouped by Industry
+        industry_changes = (
+            merged_df.filter(pl.col("industry").is_not_null())
+            .group_by("industry")
+            .agg(
+                pl.col("total_value_latest").fill_null(0).sum().alias("latest_total"),
+                pl.col("total_value_prev").fill_null(0).sum().alias("prev_total"),
+            )
+            .with_columns(
+                pl.when(pl.col("prev_total") > 0)
+                .then(
+                    (
+                        (pl.col("latest_total") - pl.col("prev_total"))
+                        / pl.col("prev_total")
+                    )
+                    * 100
+                )
+                .otherwise(None)
+                .round(2)
+                .alias("percent_change")
+            )
         )
+
+        inc_industries = industry_changes.filter(
+            (pl.col("percent_change") > 0) | (pl.col("prev_total") == 0)
+        ).sort("percent_change", descending=True, nulls_last=False)
+
+        dec_industries = industry_changes.filter(pl.col("percent_change") < 0).sort(
+            "percent_change", descending=False
+        )
+
+        # 2. Changes grouped by SIC Code
+        sic_changes = (
+            merged_df.filter(pl.col("sic").is_not_null())
+            .group_by("sic")
+            .agg(
+                pl.col("total_value_latest").fill_null(0).sum().alias("latest_total"),
+                pl.col("total_value_prev").fill_null(0).sum().alias("prev_total"),
+            )
+            .with_columns(
+                pl.when(pl.col("prev_total") > 0)
+                .then(
+                    (
+                        (pl.col("latest_total") - pl.col("prev_total"))
+                        / pl.col("prev_total")
+                    )
+                    * 100
+                )
+                .otherwise(None)
+                .round(2)
+                .alias("percent_change")
+            )
+        )
+
+        inc_sics = sic_changes.filter(
+            (pl.col("percent_change") > 0) | (pl.col("prev_total") == 0)
+        ).sort("percent_change", descending=True, nulls_last=False)
+
+        dec_sics = sic_changes.filter(pl.col("percent_change") < 0).sort(
+            "percent_change", descending=False
+        )
+
+        ### SECTOR ANALYSIS END ###
 
         # if previously no shares, now has shares -> new holding
         new_holdings = merged_df.filter(pl.col("total_shares_prev").is_null()).select(
@@ -1344,8 +1430,18 @@ async def compare_holdings(
                     "decreased_holdings_count": decreased_holdings.height,
                     "unchanged_holdings_count": unchanged_holdings.height,
                     "sector_changes": {
-                        "increased_by_sector": increased_sectors.to_dicts(),
-                        "decreased_by_sector": decreased_sectors.to_dicts(),
+                        "by_sector": {
+                            "increased": increased_sectors.to_dicts(),
+                            "decreased": decreased_sectors.to_dicts(),
+                        },
+                        "by_industry": {
+                            "increased": inc_industries.to_dicts(),
+                            "decreased": dec_industries.to_dicts(),
+                        },
+                        "by_sic": {
+                            "increased": inc_sics.to_dicts(),
+                            "decreased": dec_sics.to_dicts(),
+                        },
                     },
                 },
             },
