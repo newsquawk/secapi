@@ -1,7 +1,6 @@
 from pydantic import BaseModel
 import datetime as dt
-from typing import Optional
-from typing import List
+from typing import Optional, Dict, Any, List
 
 
 class Filing(BaseModel):
@@ -53,6 +52,7 @@ class HoldingActivity(BaseModel):
     # Stock/Holding Info
     issuer_name: str
     cusip: str
+    ticker: Optional[str] = None
     is_common_stock: bool
 
     # Change Info
@@ -70,6 +70,13 @@ class HoldingActivity(BaseModel):
     # --- ADD THESE TWO LINES ---
     current_price_per_share: Optional[float] = None
     previous_price_per_share: Optional[float] = None
+
+
+class HoldingsRequest(BaseModel):
+    new_holdings: List[Dict[str, Any]]
+    closed_positions: List[Dict[str, Any]]
+    increased_holdings: List[Dict[str, Any]]
+    decreased_holdings: List[Dict[str, Any]]
 
 
 class LatestActivityResponse(BaseModel):

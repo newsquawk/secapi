@@ -1,5 +1,5 @@
 import psycopg2
-from fastapi import FastAPI, Depends, HTTPException, Query, Body
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, Request
 import os
 import uvicorn
 import polars as pl
@@ -9,24 +9,42 @@ from openai import AsyncOpenAI
 from fastapi import HTTPException
 from psycopg2.extras import RealDictCursor
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 from pydantic import BaseModel
 import datetime as dt
 import pandas as pd
+import logging
+import sys
+
+# rate-limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from sec_models import (
     Filing,
-    FlowResponse,
     LatestActivityResponse,
     HoldingActivity,
     DailyFlowEntry,
     DailyFlowResponse,
+    HoldingsRequest,
 )
-from sic import SIC_MAPPING
-
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
+COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
+
+log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+numeric_level = getattr(logging, log_level_str, logging.INFO)
+
+# Set up logging
+logging.basicConfig(
+    level=numeric_level,  # Change to logging.DEBUG if you want more verbosity
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("secapi")
 
 if DEEPSEEK_API_KEY:
     client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -38,14 +56,16 @@ DEFINED_SCHEMA = {
     "accession_no": pl.String,
 }
 
+# Load ticker to CUSIP mapping
 TICKER_TO_CUSIP = {}
 try:
     mapping_df = pd.read_csv("ticker_cusip_mapping.csv")
     # Convert tickers to uppercase for case-insensitive lookup, and map to CUSIP
     TICKER_TO_CUSIP = dict(zip(mapping_df["ticker"].str.upper(), mapping_df["cusip"]))
 except Exception as e:
-    print(f"Warning: Could not load ticker_cusip_mapping.csv: {e}")
+    logger.warning(f"Could not load ticker_cusip_mapping.csv: {e}")
 
+# Load CUSIP details
 CUSIP_DETAILS_DF = pl.DataFrame()
 try:
     # We only read 'cusip' and 'sic' to minimize memory footprint
@@ -64,16 +84,26 @@ try:
 
     # Ensure there are no duplicate CUSIPs mapping to multiple SICs
     CUSIP_DETAILS_DF = CUSIP_DETAILS_DF.unique(subset=["cusip"], keep="first")
-    print(f"Loaded {CUSIP_DETAILS_DF.height} CUSIP-to-SIC mappings.")
+    logger.info(f"Loaded {CUSIP_DETAILS_DF.height} CUSIP-to-SIC mappings.")
 except Exception as e:
-    print(f"Warning: Could not load cusip_details_filtered.csv: {e}")
+    logger.warning(f"Warning: Could not load cusip_details_filtered.csv: {e}")
 
-### FastAPI app setup ###
+# Initialize FastAPI app and rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=["5/minute"])
 app = FastAPI(title="SEC API", version="1.0.0", debug=True)
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS configuration
 origins_env = os.environ.get("CORS_ORIGINS", "").split(",")
 allow_origins = [origin.strip() for origin in origins_env if origin.strip()]
+logger.info(
+    f"CORS allowed origins: {allow_origins if allow_origins else 'All origins allowed'}"
+)
 
+# If no origins are specified, allow all (not recommended for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,  # Your frontend origins
@@ -97,6 +127,7 @@ def get_db_connection():
         )
         return conn
     except psycopg2.OperationalError as e:
+        logger.error(f"Database connection failed: {e}", exc_info=True)
         # Raise an exception that FastAPI can handle
         raise HTTPException(status_code=500, detail=f"Database connection failed: {e}")
 
@@ -107,7 +138,6 @@ def get_db_cursor():
     is properly managed.
     """
     conn = get_db_connection()
-    # Use RealDictCursor to get results as dictionaries
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
         yield cursor
@@ -117,7 +147,7 @@ def get_db_cursor():
 
 
 @app.get("/")
-def read_root():
+def read_root(request: Request):
     return {"message": "Welcome to the SEC API"}
 
 
@@ -160,6 +190,7 @@ def _format_address(
 
 @app.get("/managers/", response_model=list[dict])
 def get_managers(
+    request: Request,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
     limit: int = 100,
     offset: int = 0,
@@ -188,6 +219,9 @@ def get_managers(
             LIMIT %s OFFSET %s
         """
     # Execute the query and fetch the results directly into a Pandas DataFrame
+    logger.info(
+        f"Executing query to fetch managers with limit={limit} and offset={offset}"
+    )
     db.execute(query, (limit, offset))
     results = db.fetchall()
 
@@ -221,11 +255,13 @@ def get_managers(
             }
         )
 
+    logger.info(f"Fetched {len(companies)} managers from the database.")
     return companies
 
 
 @app.get("/managers/{cik}", response_model=dict)
 def get_manager(
+    request: Request,
     cik: str,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -255,10 +291,12 @@ def get_manager(
     """
 
     try:
+        logger.info(f"Executing query to fetch manager with CIK={cik}")
         db.execute(query, (cik,))
         result = db.fetchone()
 
         if not result:
+            logger.error(f"Manager with CIK {cik} not found in the database.")
             raise HTTPException(
                 status_code=404, detail=f"Manager with CIK {cik} not found"
             )
@@ -290,11 +328,13 @@ def get_manager(
 
         return manager_data
     except Exception as e:
+        logger.error(f"Error fetching manager with CIK {cik}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 
 @app.get("/managers/{cik}/filings")
 def get_manager_filings(
+    request: Request,
     cik: str,
     limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
@@ -305,9 +345,13 @@ def get_manager_filings(
     """
 
     try:
+        logger.info(
+            f"Fetching filings for manager with CIK={cik}, limit={limit}, offset={offset}"
+        )
         db.execute("SELECT company_id FROM companies WHERE cik_number = %s", (cik,))
         company: dict = db.fetchone()  # type: ignore
         if not company:
+            logger.error(f"Manager with CIK {cik} not found when fetching filings.")
             raise HTTPException(
                 status_code=404, detail=f"Manager with CIK {cik} not found"
             )
@@ -318,6 +362,7 @@ def get_manager_filings(
         total_count = db.fetchone()["count"]  # type: ignore
 
         if total_count == 0:
+            logger.info(f"No filings found for manager with CIK={cik}")
             return {
                 "filings": [],
                 "pagination": {
@@ -344,6 +389,9 @@ def get_manager_filings(
             ORDER BY filing_date DESC
             LIMIT %s OFFSET %s
         """
+        logger.info(
+            f"Executing filings query for company_id={company_id} with limit={limit} and offset={offset}"
+        )
         db.execute(filings_query, (company_id, limit, offset))
         filings_data = db.fetchall()
 
@@ -363,13 +411,21 @@ def get_manager_filings(
             },
         }
     except HTTPException:
+        logger.error(
+            f"Error fetching filings for manager with CIK {cik}: Manager not found."
+        )
         raise
     except Exception as e:
+        logger.error(
+            f"Error fetching filings for manager with CIK {cik}: {str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 
 @app.get("/filings/", response_model=dict)
 def get_filings(
+    request: Request,
     limit: int = Query(100, description="Number of items to return", ge=1, le=100),
     offset: int = Query(0, description="Number of items to skip", ge=0),
     sort_by: str = Query("filing_date", description="Column to sort by"),
@@ -388,10 +444,12 @@ def get_filings(
     }
 
     if sort_by not in allowed_sort_columns:
+        logger.error(f"Invalid sort column specified: {sort_by}")
         raise HTTPException(status_code=400, detail="Invalid sort column specified.")
 
     # --- 2. Security: Validate sort order ---
     if sort_order.lower() not in ["asc", "desc"]:
+        logger.error(f"Invalid sort order specified: {sort_order}")
         raise HTTPException(
             status_code=400, detail="Invalid sort order. Use 'asc' or 'desc'."
         )
@@ -429,7 +487,9 @@ def get_filings(
                 ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST
                 LIMIT %s OFFSET %s
             """
-
+            logger.info(
+                f"Executing filings query with AUM sorting, limit={limit}, offset={offset}"
+            )
             db.execute(filings_query, (limit, offset))
             filings_data = db.fetchall()
         else:
@@ -444,6 +504,7 @@ def get_filings(
                 order_by_clause += ", f.filing_date DESC, f.created_at DESC"
 
             if total_count == 0:
+                logger.info("No filings found in the database.")
                 return {
                     "filings": [],
                     "pagination": {
@@ -492,11 +553,13 @@ def get_filings(
         }
 
     except Exception as e:
+        logger.error(f"Error fetching filings: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/filings/{accession_number}", response_model=dict)
 def get_filing_by_accession(
+    request: Request,
     accession_number: str,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -518,10 +581,15 @@ def get_filing_by_accession(
             LEFT JOIN companies c ON f.company_id = c.company_id
             WHERE f.accession_number = %s
         """
+        logger.info(
+            "Executing query to fetch filing with accession number: %s",
+            accession_number,
+        )
         db.execute(query, (accession_number,))
         result = db.fetchone()
 
         if not result:
+            logger.error(f"Filing with accession number {accession_number} not found.")
             raise HTTPException(
                 status_code=404,
                 detail=f"Filing with accession number {accession_number} not found",
@@ -530,11 +598,16 @@ def get_filing_by_accession(
         return result  # type: ignore
 
     except Exception as e:
+        logger.error(
+            f"Error fetching filing with accession number {accession_number}: {e}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/holdings/{accession_number}", response_model=dict)
 def get_holding_by_accession_number(
+    request: Request,
     accession_number: str,
     # limit: int = Query(100, ge=1, le=1000),
     # offset: int = Query(0, ge=0),
@@ -631,6 +704,9 @@ def get_holding_by_accession_number(
             OFFSET %s LIMIT %s;
         """
         query_params = search_params + [start, length]
+        logger.info(
+            f"Executing holdings query for accession_number={accession_number} with search='{search_value}', order_by='{order_by_column} {order_direction}', start={start}, length={length}"
+        )
         db.execute(holdings_query, query_params)
         holdings_data = db.fetchall()
 
@@ -660,31 +736,37 @@ def get_holding_by_accession_number(
         }
 
     except HTTPException:
-        raise
+        logger.error(f"Holdings for accession number {accession_number} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Holdings for accession number {accession_number} not found",
+        )
     except Exception as e:
+        logger.error(
+            f"Error fetching holdings for accession number {accession_number}: {e}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
-class HoldingsRequest(BaseModel):
-    new_holdings: List[Dict[str, Any]]
-    closed_positions: List[Dict[str, Any]]
-    increased_holdings: List[Dict[str, Any]]
-    decreased_holdings: List[Dict[str, Any]]
-
-
 @app.post("/api/ai_summary")
-async def openai_call(request: HoldingsRequest = Body(...)):
+@limiter.limit("5/minute")
+async def openai_call(
+    request: Request,
+    payload: HoldingsRequest = Body(...),
+):
 
     if not DEEPSEEK_API_KEY:
+        logger.error("DEEPSEEK_API_KEY is not configured. Cannot call OpenAI API.")
         return JSONResponse(
             content={"summary": "API key not configured"}, status_code=503
         )
 
     # Frontend POST request will be in dict format?
-    new_holdings = pl.DataFrame(request.new_holdings)
-    closed_positions = pl.DataFrame(request.closed_positions)
-    increased_holdings = pl.DataFrame(request.increased_holdings)
-    decreased_holdings = pl.DataFrame(request.decreased_holdings)
+    new_holdings = pl.DataFrame(payload.new_holdings)
+    closed_positions = pl.DataFrame(payload.closed_positions)
+    increased_holdings = pl.DataFrame(payload.increased_holdings)
+    decreased_holdings = pl.DataFrame(payload.decreased_holdings)
 
     new_holdings_top_5 = pl.DataFrame()
     closed_positions_top_5 = pl.DataFrame()
@@ -753,7 +835,7 @@ async def openai_call(request: HoldingsRequest = Body(...)):
         [f"{k} {v}" for k, v in decreased_holdings_dict.items()]
     )
 
-    async def get_summary(title, data_text):
+    async def _get_summary(title, data_text):
         prompt = f"""
         Generate a summary of the holdings changes for the fund management in one or two sentences.
         {title}: {data_text}
@@ -773,16 +855,24 @@ async def openai_call(request: HoldingsRequest = Body(...)):
         return response.choices[0].message.content
 
     api_calls = [
-        get_summary("New Holdings", new_holding_text),
-        get_summary("Closed Positions", closed_positions_text),
-        get_summary("Increased Holdings", increased_holdings_text),
-        get_summary("Decreased Holdings", decreased_holdings_text),
+        _get_summary("New Holdings", new_holding_text),
+        _get_summary("Closed Positions", closed_positions_text),
+        _get_summary("Increased Holdings", increased_holdings_text),
+        _get_summary("Decreased Holdings", decreased_holdings_text),
     ]
+    try:
+        texts = await asyncio.gather(*api_calls)
 
-    texts = await asyncio.gather(*api_calls)
-
-    final_summary = " ".join([text for text in texts if text])
-    return JSONResponse(content={"summary": final_summary})
+        final_summary = " ".join([text for text in texts if text])
+        return JSONResponse(content={"summary": final_summary})
+    except Exception as e:
+        logger.error(f"Error calling OpenAI API: {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "summary": "AI summary is currently unavailable due to a provider error."
+            },
+            status_code=502,
+        )
 
 
 def _df_to_dict_list(df: pl.DataFrame):
@@ -790,11 +880,6 @@ def _df_to_dict_list(df: pl.DataFrame):
     if df.is_empty():
         return []
     return df.to_dicts()
-
-
-def run_in_threadpool(func, *args):
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, func, *args)
 
 
 FILING_QUERY_WITH_PRIORITY = """
@@ -864,48 +949,6 @@ HOLDINGS_SCHEMA = {
     "sic": pl.Int64,
 }
 
-COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
-
-MAX_PER_SHARE_PRICE = 11.0
-MIN_PER_SHARE_PRICE = 0.1
-
-
-def get_sic_division(sic_code):
-    try:
-        # Convert code to an integer for numerical comparison
-        code = int(sic_code)
-    except (ValueError, TypeError):
-        return "Unclassified Code"
-
-    if 0 <= code <= 999:
-        # Range 0100-0999 in the table
-        return "Agriculture, Forestry and Fishing"
-    elif 1000 <= code <= 1499:
-        return "Mining"
-    elif 1500 <= code <= 1799:
-        return "Construction"
-    elif 1800 <= code <= 1999:
-        return "Not Used"
-    elif 2000 <= code <= 3999:
-        return "Manufacturing"
-    elif 4000 <= code <= 4999:
-        return "Transportation, Communications, Electric, Gas and Sanitary Service"
-    elif 5000 <= code <= 5199:
-        return "Wholesale Trade"
-    elif 5200 <= code <= 5999:
-        return "Retail Trade"
-    elif 6000 <= code <= 6799:
-        return "Finance, Insurance and Real estate"
-    elif 7000 <= code <= 8999:
-        return "Services"
-    elif 9100 <= code <= 9729:
-        return "Public administration"
-    elif 9900 <= code <= 9999:
-        return "Non-Classifiable"
-    else:
-        # This handles codes that fall in the gaps (e.g., 9000, 9800)
-        return "Unclassified Code"
-
 
 def _process_filings(
     df: pl.DataFrame,
@@ -914,6 +957,9 @@ def _process_filings(
     suffix = "latest" if latest else "prev"
 
     if df.is_empty():
+        logger.warning(
+            f"No holdings data found for {'latest' if latest else 'previous'} filing."
+        )
         output_schema = {
             "cusip": pl.Utf8,
             "put_or_call": pl.Utf8,
@@ -972,7 +1018,8 @@ def _process_filings(
 
 
 @app.get("/analysis/{previous_accession}/{latest_accession}", response_model=dict)
-async def compare_holdings(
+def compare_holdings(
+    request: Request,
     previous_accession: str,
     latest_accession: str,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
@@ -993,13 +1040,17 @@ async def compare_holdings(
         db.execute(FILING_QUERY_WITH_PRIORITY, (acc_latest, acc_latest))
         latest_filing = db.fetchone()
 
-        # TODO: fetch filings by API (async)
-
         if not previous_filing:
+            logger.error(
+                "Previous filing with accession number %s not found.", acc_prev
+            )
             raise HTTPException(
                 status_code=404, detail=f"Previous filing {acc_prev} not found"
             )
         if not latest_filing:
+            logger.error(
+                "Latest filing with accession number %s not found.", acc_latest
+            )
             raise HTTPException(
                 status_code=404, detail=f"Latest filing {acc_latest} not found"
             )
@@ -1008,6 +1059,11 @@ async def compare_holdings(
         previous_acc = previous_filing["accession_number"]  # type: ignore
 
         if previous_filing["cik_number"] != latest_filing["cik_number"]:
+            logger.error(
+                "CIK mismatch: Previous filing CIK %s does not match Latest filing CIK %s",
+                previous_filing["cik_number"],
+                latest_filing["cik_number"],
+            )
             return {"error": "CIK for latest and previous quarters do not match"}
 
         # Ensure correct ordering based on filing dates
@@ -1120,9 +1176,7 @@ async def compare_holdings(
             prev_other_aggregated, on="cusip", how="full", suffix="_prev"
         )
 
-        # --- NEW: ENRICH WITH CSV METADATA ---
         if not CUSIP_DETAILS_DF.is_empty():
-            # Drop the database 'sic' and 'sic_prev' so we don't get column collisions
             if "sic" in merged_df.columns:
                 merged_df = merged_df.drop(["sic", "sic_prev"])
 
@@ -1131,7 +1185,6 @@ async def compare_holdings(
             merged_other_df = merged_other_df.join(
                 CUSIP_DETAILS_DF, on="cusip", how="left"
             )
-        # --------------------------------------
 
         #### SECTOR ANALYSIS ####
         sector_changes = (
@@ -1262,6 +1315,7 @@ async def compare_holdings(
             "total_units_latest",
             "total_value_latest",
             "put_or_call",
+            "cusip",
         )
         closed_other_positions = merged_other_df.filter(
             pl.col("total_units_latest").is_null()
@@ -1270,6 +1324,7 @@ async def compare_holdings(
             "total_units_prev",
             "total_value_prev",
             "put_or_call",
+            "cusip_prev",
         )
 
         # Common holdings with changes (increase or decreases)
@@ -1357,6 +1412,7 @@ async def compare_holdings(
                 "change_in_units",
                 "percent_change",
                 "put_or_call",
+                "cusip",
             )
         )
 
@@ -1387,6 +1443,16 @@ async def compare_holdings(
             by="percent_change", descending=True
         ).head(5)
         top_5_decreased_common = decreased_holdings.sort(by="percent_change").head(5)
+
+        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
+
+        def inject_tickers(data_list, cusip_key="cusip"):
+            if not data_list:
+                return []
+            for item in data_list:
+                val = item.get(cusip_key)
+                item["ticker"] = CUSIP_TO_TICKER.get(val)
+            return data_list
 
         # Prepare response data
         response_data = {
@@ -1446,31 +1512,55 @@ async def compare_holdings(
                 },
             },
             "holdings": {
-                "top_holdings_by_value": top_5_holdings_by_value.to_dicts(),
-                "top_other_securities_by_value": top_5_holdings_other_by_value.to_dicts(),
+                "top_holdings_by_value": inject_tickers(
+                    top_5_holdings_by_value.to_dicts()
+                ),
+                "top_other_securities_by_value": inject_tickers(
+                    top_5_holdings_other_by_value.to_dicts()
+                ),
                 "new_holdings": {
-                    "top_5": top_5_new_common.to_dicts(),
-                    "common_stock": _df_to_dict_list(new_holdings),
-                    "other_securities": _df_to_dict_list(new_other_holdings),
+                    "top_5": inject_tickers(top_5_new_common.to_dicts()),
+                    "common_stock": inject_tickers(_df_to_dict_list(new_holdings)),
+                    "other_securities": inject_tickers(
+                        _df_to_dict_list(new_other_holdings)
+                    ),
                 },
                 "closed_positions": {
-                    "top_5": top_5_closed_common.to_dicts(),
-                    "common_stock": _df_to_dict_list(closed_positions),
-                    "other_securities": _df_to_dict_list(closed_other_positions),
+                    "top_5": inject_tickers(
+                        top_5_closed_common.to_dicts(), "cusip_prev"
+                    ),
+                    "common_stock": inject_tickers(
+                        _df_to_dict_list(closed_positions), "cusip_prev"
+                    ),
+                    "other_securities": inject_tickers(
+                        _df_to_dict_list(closed_other_positions), "cusip_prev"
+                    ),
                 },
                 "increased_holdings": {
-                    "top_5": top_5_increased_common.to_dicts(),
-                    "common_stock": _df_to_dict_list(increased_holdings),
-                    "other_securities": _df_to_dict_list(increased_other_holdings),
+                    "top_5": inject_tickers(top_5_increased_common.to_dicts()),
+                    "common_stock": inject_tickers(
+                        _df_to_dict_list(increased_holdings)
+                    ),
+                    "other_securities": inject_tickers(
+                        _df_to_dict_list(increased_other_holdings)
+                    ),
                 },
                 "decreased_holdings": {
-                    "top_5": top_5_decreased_common.to_dicts(),
-                    "common_stock": _df_to_dict_list(decreased_holdings),
-                    "other_securities": _df_to_dict_list(decreased_other_holdings),
+                    "top_5": inject_tickers(top_5_decreased_common.to_dicts()),
+                    "common_stock": inject_tickers(
+                        _df_to_dict_list(decreased_holdings)
+                    ),
+                    "other_securities": inject_tickers(
+                        _df_to_dict_list(decreased_other_holdings)
+                    ),
                 },
                 "common_holdings": {
-                    "common_stock": _df_to_dict_list(unchanged_holdings),
-                    "other_securities": _df_to_dict_list(unchanged_other_holdings),
+                    "common_stock": inject_tickers(
+                        _df_to_dict_list(unchanged_holdings)
+                    ),
+                    "other_securities": inject_tickers(
+                        _df_to_dict_list(unchanged_other_holdings)
+                    ),
                 },
             },
         }
@@ -1478,13 +1568,16 @@ async def compare_holdings(
         return response_data
 
     except HTTPException as e:
+        logger.error(f"HTTPException occurred: {e.detail}")
         raise
     except Exception as e:
+        logger.error(f"An unexpected error occurred: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 
 @app.get("/comparisons", response_model=list)
 def get_recent_comparisons(
+    request: Request,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
@@ -1496,10 +1589,14 @@ def get_recent_comparisons(
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
         """
+        logger.info(
+            f"Fetching recent comparisons with limit {limit} and offset {offset}"
+        )
         db.execute(query, (limit, offset))
         comparisons = db.fetchall()
         return comparisons
     except Exception as e:
+        logger.error(f"Error fetching recent comparisons: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1510,7 +1607,8 @@ class ComparisonRequest(BaseModel):
 
 @app.post("/comparisons")
 def save_comparison(
-    request: ComparisonRequest,
+    request: Request,
+    comparison_request: ComparisonRequest,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     try:
@@ -1518,11 +1616,12 @@ def save_comparison(
             INSERT INTO recent_comparisons (accession_number_1, accession_number_2)
             VALUES (%s, %s)
         """
-        db.execute(query, (request.acc_num_1, request.acc_num_2))
+        db.execute(query, (comparison_request.acc_num_1, comparison_request.acc_num_2))
         db.connection.commit()
 
         return {"message": "Comparison saved successfully"}
     except Exception as e:
+        logger.error(f"Error saving comparison: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1537,11 +1636,13 @@ def api_save_comparison(accession_1: str, accession_2: str, db):
 
         return {"message": "Comparison saved successfully"}
     except Exception as e:
+        logger.error(f"Error saving comparison: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/company/{cik}/compare/latest")
-async def compare_latest_filings(
+def compare_latest_filings(
+    request: Request,
     cik: str,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -1579,11 +1680,14 @@ async def compare_latest_filings(
         latest_filing = filings[0]["accession_number"]
         previous_filing = filings[1]["accession_number"]
 
-        print(f"Comparing filings {previous_filing} and {latest_filing} for CIK {cik}")
+        logger.info(
+            f"Comparing filings {previous_filing} and {latest_filing} for CIK {cik}"
+        )
 
         # Step 2: Use the existing compare_holdings logic to perform the comparison
         # You'll need to call the function directly here
-        return await compare_holdings(
+        return compare_holdings(
+            request=request,
             previous_accession=previous_filing,
             latest_accession=latest_filing,
             db=db,
@@ -1592,6 +1696,9 @@ async def compare_latest_filings(
     except HTTPException:
         raise  # Re-raise HTTPException to be handled by FastAPI
     except Exception as e:
+        logger.error(
+            f"Error comparing latest filings for CIK {cik}: {str(e)}", exc_info=True
+        )
         raise HTTPException(
             status_code=500, detail=f"An unexpected error occurred: {str(e)}"
         )
@@ -1602,6 +1709,7 @@ class SignificantHolding(BaseModel):
 
     issuer_name: str
     cusip: str | None = None
+    ticker: Optional[str] = None
     shares_or_principal_amount: int
     value: int
     # The 'change_type' can be 'new', 'increase', 'decrease', etc.
@@ -1612,6 +1720,7 @@ class SignificantHolding(BaseModel):
 class HoldingChange(BaseModel):
     issuer_name: str
     cusip: Optional[str] = None
+    ticker: Optional[str] = None
     shares_or_principal_amount: int  # The new, current amount of shares
     change_in_share: int
     percent_change: Optional[float] = (
@@ -1703,6 +1812,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
     WITH FilingsWithPrevious AS (
         SELECT * FROM (VALUES %s) AS t (
             filing_id, company_id, accession_number, period_of_report, filing_date,
+            created_at,
             company_name, cik_number, aum, previous_filing_id, previous_accession_number
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
@@ -1731,9 +1841,17 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,
                 COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
-                curr.total_value AS current_value,
+                CASE
+                    WHEN curr.total_shares > 0 AND COALESCE(curr.is_common_stock, prev.is_common_stock) AND (curr.total_value::numeric / curr.total_shares) < 1.0
+                    THEN curr.total_value * 1000
+                    ELSE curr.total_value
+                END AS current_value,
                 curr.total_shares AS current_shares,
-                prev.total_value AS previous_value,
+                CASE
+                    WHEN prev.total_shares > 0 AND COALESCE(curr.is_common_stock, prev.is_common_stock) AND (prev.total_value::numeric / prev.total_shares) < 1.0
+                    THEN prev.total_value * 1000
+                    ELSE prev.total_value
+                END AS previous_value,
                 prev.total_shares AS previous_shares,
                 (curr.total_shares - prev.total_shares) AS change_in_share,
                 CASE
@@ -1878,14 +1996,16 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         RankedChanges rc ON fwp.filing_id = rc.filing_id
     GROUP BY
         fwp.filing_id, fwp.cik_number, fwp.aum, fwp.accession_number, fwp.previous_accession_number,
-        fwp.company_name, fwp.period_of_report, fwp.filing_date
+        fwp.company_name, fwp.period_of_report, fwp.filing_date, fwp.created_at
     ORDER BY
-        fwp.filing_date DESC, fwp.accession_number DESC;
+        fwp.filing_date DESC, fwp.created_at DESC;
 """
 
 
 @app.get("/stories/latest/v2", response_model=LatestStoriesResponse)
-async def get_latest_stories_v2(
+@limiter.limit("20/minute")
+def get_latest_stories_v2(
+    request: Request,
     limit: int = Query(20, description="Number of stories to return", ge=1, le=50),
     offset: int = Query(
         0, description="Number of stories to skip for pagination", ge=0
@@ -1894,18 +2014,25 @@ async def get_latest_stories_v2(
 ):
     """
     Retrieves a list of the latest filings, each with a summary of its most
-    significant new holding. (Now optimized!)
+    significant new holding.
+
+    **Note:** This endpoint explicitly filters for candidate filings that contain
+    at least one Common Stock holding. Funds exclusively trading ETFs, options,
+    or other non-common securities are intentionally excluded from this feed.
     """
     try:
         # Get filings
+        logger.info(
+            f"Fetching latest stories v2 with limit {limit} and offset {offset}"
+        )
         db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
-        print("Executed FILING_QUERY_V2")
         candidate_filings = db.fetchall()
 
         has_next_page = len(candidate_filings) > limit
         candidates_to_process = candidate_filings[:limit]
 
         if not candidates_to_process:
+            logger.info("No candidate filings found for the given limit and offset.")
             return LatestStoriesResponse(stories=[])
 
         candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
@@ -1914,8 +2041,8 @@ async def get_latest_stories_v2(
             "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
         }
         # Filter filings
+        logger.info("Filtering candidate filings")
         db.execute(FILTER_CANDIDATES_QUERY_V2, params)
-        print("Executed FILTER_CANDIDATES_QUERY_V2")
         valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
 
         # Filter our candidate list in Python
@@ -1924,6 +2051,7 @@ async def get_latest_stories_v2(
         ]
 
         if not valid_filings:
+            logger.info("No valid filings found after filtering.")
             return LatestStoriesResponse(stories=[])
 
         filing_ids_to_process = set()
@@ -1942,6 +2070,7 @@ async def get_latest_stories_v2(
                     f["accession_number"],
                     f["period_of_report"],
                     f["filing_date"],
+                    f["created_at"],
                     f["company_name"],
                     f["cik_number"],
                     f["aum"],
@@ -1954,7 +2083,7 @@ async def get_latest_stories_v2(
         for t in filing_data_tuples:
             # db.mogrify() safely formats a single tuple
             values_string_list.append(
-                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
                     "utf-8"
                 )
             )
@@ -1974,10 +2103,11 @@ async def get_latest_stories_v2(
             "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
         }
         db.execute(final_query_template, final_query_params)
-        print("Executing final optimized stories query")
+        logger.debug("Executing final optimized stories query")
 
-        # db.execute(query_with_values, final_query_params)
         results = db.fetchall()
+
+        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
 
         story_summaries = []
         for row in results:
@@ -1986,6 +2116,7 @@ async def get_latest_stories_v2(
                 SignificantHolding(
                     issuer_name=row["top_new_issuer"],
                     cusip=row["top_new_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_new_cusip"]),
                     shares_or_principal_amount=row["top_new_shares"],
                     value=row["top_new_value"],
                     price_per_share=row["top_new_price"],
@@ -1999,6 +2130,7 @@ async def get_latest_stories_v2(
                 SignificantHolding(
                     issuer_name=row["top_closed_issuer"],
                     cusip=row["top_closed_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_closed_cusip"]),
                     shares_or_principal_amount=row["top_closed_shares"],
                     value=row["top_closed_value"],
                     price_per_share=row["top_closed_price"],
@@ -2012,6 +2144,7 @@ async def get_latest_stories_v2(
                 HoldingChange(
                     issuer_name=row["top_increased_issuer"],
                     cusip=row["top_increased_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_increased_cusip"]),
                     shares_or_principal_amount=row["top_increased_shares"],
                     change_in_share=row["top_increased_change_in_share"],
                     percent_change=row["top_increased_percent_change"],
@@ -2026,6 +2159,7 @@ async def get_latest_stories_v2(
                 HoldingChange(
                     issuer_name=row["top_decreased_issuer"],
                     cusip=row["top_decreased_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_decreased_cusip"]),
                     shares_or_principal_amount=row["top_decreased_shares"],
                     change_in_share=row["top_decreased_change_in_share"],
                     percent_change=row["top_decreased_percent_change"],
@@ -2041,6 +2175,7 @@ async def get_latest_stories_v2(
                 SignificantHolding(
                     issuer_name=row["top_new_other_issuer"],
                     cusip=row["top_new_other_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_new_other_cusip"]),
                     shares_or_principal_amount=row["top_new_other_shares"],
                     value=row["top_new_other_value"],
                     price_per_share=row["top_new_other_price"],
@@ -2054,6 +2189,7 @@ async def get_latest_stories_v2(
                 SignificantHolding(
                     issuer_name=row["top_closed_other_issuer"],
                     cusip=row["top_closed_other_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_closed_other_cusip"]),
                     shares_or_principal_amount=row["top_closed_other_shares"],
                     value=row["top_closed_other_value"],
                     price_per_share=row["top_closed_other_price"],
@@ -2067,6 +2203,7 @@ async def get_latest_stories_v2(
                 HoldingChange(
                     issuer_name=row["top_increased_other_issuer"],
                     cusip=row["top_increased_other_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_increased_other_cusip"]),
                     shares_or_principal_amount=row["top_increased_other_shares"],
                     change_in_share=row["top_increased_other_change_in_share"],
                     percent_change=row["top_increased_other_percent_change"],
@@ -2081,6 +2218,7 @@ async def get_latest_stories_v2(
                 HoldingChange(
                     issuer_name=row["top_decreased_other_issuer"],
                     cusip=row["top_decreased_other_cusip"],
+                    ticker=CUSIP_TO_TICKER.get(row["top_decreased_other_cusip"]),
                     shares_or_principal_amount=row["top_decreased_other_shares"],
                     change_in_share=row["top_decreased_other_change_in_share"],
                     percent_change=row["top_decreased_other_percent_change"],
@@ -2118,9 +2256,7 @@ async def get_latest_stories_v2(
         )
 
     except Exception as e:
-        # It's good practice to log the full exception for debugging
-        # import logging
-        # logging.exception("Error fetching latest stories")
+        logger.error(f"Error fetching latest stories v2: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
@@ -2130,6 +2266,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
     WITH FilingsWithPrevious AS (
         SELECT * FROM (VALUES %s) AS t (
             filing_id, company_id, accession_number, period_of_report, filing_date,
+            created_at,
             company_name, cik_number, aum, previous_filing_id, previous_accession_number
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
@@ -2158,6 +2295,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
             fwp.previous_accession_number,
             fwp.period_of_report,
             fwp.filing_date,
+            fwp.created_at,
             COALESCE(curr.cusip, prev.cusip) AS cusip,
             COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
             curr.total_value AS current_value,
@@ -2240,12 +2378,13 @@ LATEST_ACTIVITY_QUERY_V3 = """
     WHERE
         hc.change_type IN ('new', 'closed', 'increased', 'decreased')
     ORDER BY
-        cik DESC; 
+        hc.filing_date DESC, hc.created_at DESC;
 """
 
 
 @app.get("/activity/latest/v3", response_model=LatestActivityResponse)
-async def get_latest_activity_v3(
+def get_latest_activity_v3(
+    request: Request,
     limit: int = Query(
         3, description="Number of *companies* to fetch stories for", ge=1, le=50
     ),
@@ -2257,6 +2396,10 @@ async def get_latest_activity_v3(
     """
     Retrieves a flat list of all significant holding changes (headlines)
     from the latest batch of company filings.
+
+    **Note:** This endpoint explicitly filters for candidate filings that contain
+    at least one Common Stock holding. Funds exclusively trading ETFs, options,
+    or other non-common securities are intentionally excluded from this feed.
     """
     try:
         # Step 1: Get candidate companies (paginated)
@@ -2301,6 +2444,7 @@ async def get_latest_activity_v3(
                     f["accession_number"],
                     f["period_of_report"],
                     f["filing_date"],
+                    f["created_at"],
                     f["company_name"],
                     f["cik_number"],
                     f["aum"],
@@ -2313,7 +2457,7 @@ async def get_latest_activity_v3(
         values_string_list = []
         for t in filing_data_tuples:
             values_string_list.append(
-                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
                     "utf-8"
                 )
             )
@@ -2331,14 +2475,22 @@ async def get_latest_activity_v3(
         db.execute(final_query_template, final_query_params)
         results = db.fetchall()
 
-        # Serialize into our new HoldingActivity model
-        activities = [HoldingActivity(**row) for row in results]
+        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
+
+        # Serialize into our new HoldingActivity model and inject the ticker
+        activities = []
+        for row in results:
+            activity_dict = dict(row)
+            # Try to find the ticker based on the CUSIP
+            activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
+            activities.append(HoldingActivity(**activity_dict))
 
         return LatestActivityResponse(
             activities=activities, has_next_page=has_next_page
         )
 
     except Exception as e:
+        logger.error("Failed to fetch latest activity v3", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
@@ -2346,6 +2498,7 @@ async def get_latest_activity_v3(
 
 @app.get("/api/search/companies", response_model=List[Dict[str, str]])
 def search_companies(
+    request: Request,
     q: str = Query(
         ..., min_length=2, description="Search term for company name or CIK"
     ),
@@ -2380,144 +2533,13 @@ def search_companies(
         ]
         return companies
     except Exception as e:
+        logger.error(f"Error during company search: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error during company search")
-
-
-def fetch_clean_holdings_df(
-    cursor,
-    target_cusip: str,
-    start_date: Optional[dt.date] = None,
-) -> pd.DataFrame:
-    """
-    Fetches historical holdings for a CUSIP, filtering for the
-    latest filing per quarter to handle amendments.
-    """
-    base_query = """
-        WITH latest_filings_filter AS (
-            SELECT filing_id, company_id, period_of_report
-            FROM (
-                SELECT 
-                    filing_id, company_id, period_of_report,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY company_id, period_of_report 
-                        ORDER BY filing_date DESC, accession_number DESC
-                    ) as rn
-                FROM filings
-            ) sub
-            WHERE rn = 1
-        )
-        SELECT 
-            c.cik_number,
-            lf.period_of_report as period,
-            SUM(h.shares_or_principal_amount) as shares
-        FROM holdings h
-        JOIN latest_filings_filter lf ON h.filing_id = lf.filing_id
-        JOIN companies c ON lf.company_id = c.company_id
-        JOIN issuers i ON h.issuer_id = i.issuer_id
-        LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
-        WHERE 
-            i.cusip = %s
-            AND (poc.name = 'NONE' OR poc.name IS NULL)
-        """
-
-    # Dynamic SQL parameter construction
-    params = [target_cusip]
-
-    if start_date:
-        base_query += " AND lf.period_of_report >= %s"
-        params.append(start_date)
-
-    # Add Group By and Order By at the end
-    base_query += """
-        GROUP BY c.cik_number, lf.period_of_report
-        ORDER BY lf.period_of_report ASC
-    """
-
-    # Execute query
-    cursor.execute(base_query, tuple(params))
-    results = cursor.fetchall()
-
-    if not results:
-        return pd.DataFrame()
-
-    return pd.DataFrame(results)
-
-
-# @app.get("/api/v1/flow/{cusip}", response_model=FlowResponse)
-def get_stock_flow(
-    cusip: str,
-    years: Optional[int] = Query(
-        None, description="Limit analysis to the past X years"
-    ),
-    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
-):
-    """
-    Calculates the net buying/selling flow for a specific CUSIP.
-    Aggregated over period of report (quarterly)
-    """
-
-    try:
-        # 1. Get Clean Data directly using CUSIP
-        # Note: We strip whitespace to be safe
-        clean_cusip = cusip.strip()
-
-        start_date = None
-        if years:
-            # Get today's date minus X years
-            start_date = dt.date.today() - dt.timedelta(days=365 * years)
-
-        df = fetch_clean_holdings_df(db, clean_cusip, start_date=start_date)
-
-        # 2. Handle Empty Case (No data found for this CUSIP)
-        if df.empty:
-            return {"cusip": clean_cusip, "history": []}
-
-        # 3. The "Pandas Magic" (Pivot -> Fill -> Diff)
-        df["period"] = pd.to_datetime(df["period"])
-
-        # Pivot: Rows=Date, Cols=Fund CIK
-        pivot_df = df.pivot(index="period", columns="cik_number", values="shares")
-
-        # CRITICAL: Fill missing with 0 so "Sold Out" and "New Buy" are captured
-        pivot_df = pivot_df.fillna(0)
-
-        # Calculate Quarter-over-Quarter change
-        change_df = pivot_df.diff()
-
-        # 4. Aggregate Totals
-        analysis_df = pd.DataFrame(index=change_df.index)
-        analysis_df["gross_buying"] = change_df[change_df > 0].sum(axis=1)
-        analysis_df["gross_selling"] = change_df[change_df < 0].sum(axis=1).abs()
-        analysis_df["net_change"] = (
-            analysis_df["gross_buying"] - analysis_df["gross_selling"]
-        )
-
-        # Drop the first row (invalid diff)
-        analysis_df = analysis_df.iloc[1:]
-
-        # 5. Format for JSON
-        history = []
-        for date, row in analysis_df.iterrows():
-            history.append(
-                {
-                    "date": date.strftime("%Y-%m-%d"),
-                    "gross_buying": float(row["gross_buying"]),
-                    "gross_selling": float(row["gross_selling"]),
-                    "net_change": float(row["net_change"]),
-                }
-            )
-
-        return {"cusip": clean_cusip, "history": history}
-
-    except Exception as e:
-        print(f"Error processing CUSIP {cusip}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 
 @app.get("/api/v1/flow/daily/{identifier}", response_model=DailyFlowResponse)
 def get_daily_stock_flow(
+    request: Request,
     identifier: str,
     days: int = Query(1, description="Number of days to look back", ge=1, le=365),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
@@ -2539,7 +2561,7 @@ def get_daily_stock_flow(
         if clean_cusip in CUSIP_TO_TICKER:
             ticker = CUSIP_TO_TICKER[clean_cusip]
 
-    print(
+    logger.debug(
         f"Received request for identifier: {identifier}, resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
     )
 
@@ -2614,7 +2636,7 @@ def get_daily_stock_flow(
     try:
         # Pass params: start_date, then cusip twice (for current and prev join)
         db.execute(query, (start_date, clean_cusip, clean_cusip))
-        print(
+        logger.debug(
             f"Executed daily flow query for CUSIP {clean_cusip} starting from {start_date}"
         )
         results = db.fetchall()
@@ -2634,12 +2656,16 @@ def get_daily_stock_flow(
         )
 
     except Exception as e:
-        # Log error in production
+        logger.error(
+            f"Error fetching daily stock flow for identifier {identifier}: {str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/api/v1/search/companies_by_aum", response_model=list[dict])
 def search_companies_by_aum(
+    request: Request,
     min_aum: Optional[int] = Query(None, description="Minimum AUM"),
     max_aum: Optional[int] = Query(None, description="Maximum AUM"),
     limit: int = Query(100, ge=1, le=1000),
@@ -2690,11 +2716,13 @@ def search_companies_by_aum(
         return companies
 
     except Exception as e:
+        logger.error(f"Error searching companies by AUM: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/api/v1/search/filings_by_aum", response_model=dict)
 def search_filings_by_aum(
+    request: Request,
     min_aum: Optional[int] = Query(None, description="Minimum AUM filter"),
     max_aum: Optional[int] = Query(None, description="Maximum AUM filter"),
     ciks: Optional[List[str]] = Query(
@@ -2815,6 +2843,7 @@ def search_filings_by_aum(
         }
 
     except Exception as e:
+        logger.error(f"Error searching filings by AUM: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
