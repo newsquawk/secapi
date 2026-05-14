@@ -109,3 +109,12 @@ class DailyFlowResponse(BaseModel):
     ticker: Optional[str] = None
     cusip: str
     daily_data: List[DailyFlowEntry]
+
+
+class AggregateFlowResponse(BaseModel):
+    ticker: Optional[str] = None
+    cusip: str
+    days_looked_back: int
+    gross_buying: float
+    gross_selling: float
+    net_change: float

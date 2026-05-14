@@ -29,6 +29,7 @@ from sec_models import (
     DailyFlowEntry,
     DailyFlowResponse,
     HoldingsRequest,
+    AggregateFlowResponse,
 )
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
@@ -2296,35 +2297,48 @@ LATEST_ACTIVITY_QUERY_V3 = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
-            COALESCE(curr.cusip, prev.cusip) AS cusip,
-            COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
-            curr.total_value AS current_value,
-            curr.total_shares AS current_shares,
-            prev.total_value AS previous_value,
-            prev.total_shares AS previous_shares,
-            (curr.total_shares - prev.total_shares) AS change_in_share,
-            CASE
-                WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
-                ELSE NULL
-            END AS percent_change,
-            CASE
-                WHEN prev.cusip IS NULL THEN 'new'
-                WHEN curr.cusip IS NULL THEN 'closed'
-                WHEN curr.total_shares > prev.total_shares THEN 'increased'
-                WHEN curr.total_shares < prev.total_shares THEN 'decreased'
-                ELSE 'unchanged'
-            END as change_type,
-            COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+            hc.cusip,
+            hc.issuer_name,
+            hc.current_value,
+            hc.current_shares,
+            hc.previous_value,
+            hc.previous_shares,
+            hc.change_in_share,
+            hc.percent_change,
+            hc.change_type,
+            hc.is_common_stock
         FROM
             FilingsWithPrevious fwp
-        LEFT JOIN
-            (SELECT * FROM AggregatedHoldings) AS curr ON fwp.filing_id = curr.filing_id
-        FULL OUTER JOIN
-            (SELECT * FROM AggregatedHoldings) AS prev
-            ON fwp.previous_filing_id = prev.filing_id AND curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(curr.cusip, prev.cusip) AS cusip,
+                COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
+                curr.total_value AS current_value,
+                curr.total_shares AS current_shares,
+                prev.total_value AS previous_value,
+                prev.total_shares AS previous_shares,
+                (curr.total_shares - prev.total_shares) AS change_in_share,
+                CASE
+                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS percent_change,
+                CASE
+                    WHEN prev.cusip IS NULL THEN 'new'
+                    WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN curr.total_shares > prev.total_shares THEN 'increased'
+                    WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                    ELSE 'unchanged'
+                END as change_type,
+                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+            FROM
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.filing_id) AS curr
+            FULL OUTER JOIN
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.previous_filing_id) AS prev
+                ON curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+            WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
+        ) hc ON true
         WHERE
             fwp.previous_filing_id IS NOT NULL
-            AND (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL) -- Ensure there's a holding on either side
     )
     SELECT
         hc.cik_number AS cik,
@@ -2658,6 +2672,111 @@ def get_daily_stock_flow(
     except Exception as e:
         logger.error(
             f"Error fetching daily stock flow for identifier {identifier}: {str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/v1/flow/aggregate/{identifier}", response_model=AggregateFlowResponse)
+def get_aggregate_stock_flow(
+    request: Request,
+    identifier: str,
+    days: int = Query(14, description="Number of days to look back", ge=1, le=365),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Aggregates total buying/selling flow over the last X days into a single summary.
+    """
+    # Clean the input and map to CUSIP
+    identifier_clean = identifier.strip().upper()
+
+    ticker = None
+    if identifier_clean in TICKER_TO_CUSIP:
+        ticker = identifier_clean
+        clean_cusip = TICKER_TO_CUSIP[identifier_clean]
+    else:
+        clean_cusip = identifier_clean
+        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
+        if clean_cusip in CUSIP_TO_TICKER:
+            ticker = CUSIP_TO_TICKER[clean_cusip]
+
+    logger.debug(
+        f"Received aggregate request for identifier: {identifier}, resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
+    )
+
+    start_date = dt.date.today() - dt.timedelta(days=days)
+
+    query = """
+    WITH RelevantFilings AS (
+        -- 1. Identify all 13F filings submitted in the requested date range
+        SELECT f.filing_id, f.company_id, f.filing_date, f.period_of_report
+        FROM filings f
+        WHERE f.filing_date >= %s
+          AND f.form_type IN ('13F-HR', '13F-HR/A')
+    ),
+    PreviousFilings AS (
+        -- 2. Find immediately preceding baseline filing
+        SELECT
+            rf.filing_id AS current_filing_id,
+            (
+                SELECT f2.filing_id
+                FROM filings f2
+                WHERE f2.company_id = rf.company_id
+                  AND f2.period_of_report < rf.period_of_report
+                  AND f2.form_type IN ('13F-HR', '13F-HR/A')
+                ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
+                LIMIT 1
+            ) AS previous_filing_id
+        FROM RelevantFilings rf
+    ),
+    HoldingsComparison AS (
+        -- 3. Calculate delta
+        SELECT
+            COALESCE(h_curr.shares_or_principal_amount, 0) as current_shares,
+            COALESCE(h_prev.shares_or_principal_amount, 0) as previous_shares
+        FROM RelevantFilings rf
+        JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
+        LEFT JOIN (
+            SELECT h.filing_id, h.shares_or_principal_amount
+            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
+            WHERE i.cusip = %s 
+        ) h_curr ON rf.filing_id = h_curr.filing_id
+        LEFT JOIN (
+            SELECT h.filing_id, h.shares_or_principal_amount
+            FROM holdings h JOIN issuers i ON h.issuer_id = i.issuer_id
+            WHERE i.cusip = %s
+        ) h_prev ON pf.previous_filing_id = h_prev.filing_id
+        WHERE h_curr.shares_or_principal_amount IS NOT NULL
+           OR h_prev.shares_or_principal_amount IS NOT NULL
+    )
+    -- 4. Aggregate everything together (No GROUP BY)
+    SELECT
+        COALESCE(SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END), 0) as total_gross_buying,
+        COALESCE(SUM(CASE WHEN current_shares < previous_shares THEN ABS(current_shares - previous_shares) ELSE 0 END), 0) as total_gross_selling,
+        COALESCE(SUM(current_shares - previous_shares), 0) as total_net_change
+    FROM HoldingsComparison;
+    """
+
+    try:
+        db.execute(query, (start_date, clean_cusip, clean_cusip))
+        logger.debug(
+            f"Executed aggregate flow query for CUSIP {clean_cusip} starting from {start_date}"
+        )
+
+        result = db.fetchone()
+
+        return AggregateFlowResponse(
+            ticker=ticker,
+            cusip=clean_cusip,
+            days_looked_back=days,
+            gross_buying=float(result["total_gross_buying"]),
+            gross_selling=float(result["total_gross_selling"]),
+            net_change=float(result["total_net_change"]),
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Error fetching aggregate stock flow for identifier {identifier}: {str(e)}",
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
