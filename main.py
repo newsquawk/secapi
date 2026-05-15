@@ -843,7 +843,7 @@ async def openai_call(
         """
         # Assuming an async OpenAI client
         response = await client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[
                 {
                     "role": "system",
