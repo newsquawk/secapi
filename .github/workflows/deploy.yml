@@ -45,19 +45,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_USER: ${{ github.actor }}
-          # Pass the lowercase variable directly to the SSH environment
-          REPO_OWNER_LC: ${{ env.OWNER_LC }}
-          # Pass the new secrets into the SSH environment
+          # Pass the standard GitHub variable here
+          REPO_OWNER: ${{ github.repository_owner }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.DROPLET_USERNAME }}
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          # Tell SSH to explicitly make these variables available to the script below
+          # Ensure REPO_OWNER is in the envs list
           envs: GH_TOKEN,GH_USER,REPO_OWNER,DB_PASSWORD,DEEPSEEK_API_KEY
           script: |
-            IMAGE_NAME="ghcr.io/$REPO_OWNER_LC/secapi:latest"
+            # Convert the repository owner to lowercase directly on the Droplet
+            LOWERCASE_OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+            IMAGE_NAME="ghcr.io/$LOWERCASE_OWNER/secapi:latest"
+            
+            echo "Attempting to pull and run image: $IMAGE_NAME"
 
             # 1. Log in to GHCR
             echo $GH_TOKEN | docker login ghcr.io -u $GH_USER --password-stdin
@@ -69,7 +72,7 @@ jobs:
             docker stop secapi_container || true
             docker rm secapi_container || true
             
-            # 4. Run the new container with ALL your custom flags and secure variables
+            # 4. Run the new container
             docker run -d \
               --name secapi_container \
               --restart always \
