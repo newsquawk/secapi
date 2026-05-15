@@ -24,20 +24,29 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      
+      # --- Convert GitHub username to lowercase ---
+      - name: Set lower case owner name
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+        env:
+          OWNER: '${{ github.repository_owner }}'
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/secapi:latest
+          # Use the new lowercase variable here!
+          tags: ghcr.io/${{ env.OWNER_LC }}/secapi:latest
 
       - name: SSH into Droplet, Pull, and Restart Container
         uses: appleboy/ssh-action@v1.0.3
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_USER: ${{ github.actor }}
-          REPO_OWNER: ${{ github.repository_owner }}
+          # Pass the lowercase variable directly to the SSH environment
+          REPO_OWNER_LC: ${{ env.OWNER_LC }}
           # Pass the new secrets into the SSH environment
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -48,8 +57,7 @@ jobs:
           # Tell SSH to explicitly make these variables available to the script below
           envs: GH_TOKEN,GH_USER,REPO_OWNER,DB_PASSWORD,DEEPSEEK_API_KEY
           script: |
-            LOWERCASE_OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
-            IMAGE_NAME="ghcr.io/$LOWERCASE_OWNER/secapi:latest"
+            IMAGE_NAME="ghcr.io/$REPO_OWNER_LC/secapi:latest"
 
             # 1. Log in to GHCR
             echo $GH_TOKEN | docker login ghcr.io -u $GH_USER --password-stdin
