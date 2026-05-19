@@ -54,6 +54,7 @@ class HoldingActivity(BaseModel):
     cusip: str
     ticker: Optional[str] = None
     is_common_stock: bool
+    put_or_call: Optional[str] = None
 
     # Change Info
     change_type: str  # 'new', 'closed', 'increased', 'decreased'
@@ -67,7 +68,6 @@ class HoldingActivity(BaseModel):
     previous_value: Optional[int] = None
     absolute_value_change: int
 
-    # --- ADD THESE TWO LINES ---
     current_price_per_share: Optional[float] = None
     previous_price_per_share: Optional[float] = None
 
@@ -91,6 +91,8 @@ class FlowPoint(BaseModel):
     gross_buying: float
     gross_selling: float
     net_change: float
+    # New calculated field:
+    net_change_pct_of_float: Optional[float] = None
 
 
 class FlowResponse(BaseModel):
@@ -103,11 +105,13 @@ class DailyFlowEntry(BaseModel):
     gross_buying: float
     gross_selling: float
     net_change: float
+    net_change_pct_float: Optional[float] = None
 
 
 class DailyFlowResponse(BaseModel):
     ticker: Optional[str] = None
     cusip: str
+    free_float_shares: Optional[float] = None
     daily_data: List[DailyFlowEntry]
 
 
@@ -118,3 +122,6 @@ class AggregateFlowResponse(BaseModel):
     gross_buying: float
     gross_selling: float
     net_change: float
+    net_change_pct_float: Optional[float] = None
+    percent_change: Optional[float] = None
+    free_float_shares: Optional[float] = None

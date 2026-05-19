@@ -15,6 +15,9 @@ import datetime as dt
 import pandas as pd
 import logging
 import sys
+import math
+import json
+import yfinance as yf
 
 # rate-limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -35,6 +38,18 @@ from sec_models import (
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
+
+FREE_FLOAT_DATA = {}
+CUSIP_TO_CIK = {}
+CIK_TO_TICKER = {}
+TICKER_TO_CUSIP = {}
+CUSIP_TO_TICKER = {}
+
+RUSSELL_FILE_PATH = "data/russell_share_data.csv"
+CUSIP_DETAILS_FILE_PATH = "data/cusip_details_filtered_fixed.csv"
+CUSIP_TO_CIK_FILE_PATH = "data/cusip_to_cik.json"
+CIK_TO_TICKER_FILE_PATH = "data/cik_to_ticker.json"
+TICKER_TO_CUSIP_FILE_PATH = "data/ticker_to_cusip.json"
 
 log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
 numeric_level = getattr(logging, log_level_str, logging.INFO)
@@ -57,21 +72,12 @@ DEFINED_SCHEMA = {
     "accession_no": pl.String,
 }
 
-# Load ticker to CUSIP mapping
-TICKER_TO_CUSIP = {}
-try:
-    mapping_df = pd.read_csv("ticker_cusip_mapping.csv")
-    # Convert tickers to uppercase for case-insensitive lookup, and map to CUSIP
-    TICKER_TO_CUSIP = dict(zip(mapping_df["ticker"].str.upper(), mapping_df["cusip"]))
-except Exception as e:
-    logger.warning(f"Could not load ticker_cusip_mapping.csv: {e}")
-
 # Load CUSIP details
 CUSIP_DETAILS_DF = pl.DataFrame()
 try:
     # We only read 'cusip' and 'sic' to minimize memory footprint
     CUSIP_DETAILS_DF = pl.read_csv(
-        "cusip_details_filtered_fixed.csv",
+        CUSIP_DETAILS_FILE_PATH,
         columns=["cusip", "industry", "sic", "sicSector", "sicIndustry"],
         schema_overrides={
             "cusip": pl.Utf8,
@@ -88,6 +94,63 @@ try:
     logger.info(f"Loaded {CUSIP_DETAILS_DF.height} CUSIP-to-SIC mappings.")
 except Exception as e:
     logger.warning(f"Warning: Could not load cusip_details_filtered.csv: {e}")
+
+
+def load_float_data():
+    """Loads the Russell share data into memory on startup."""
+    global FREE_FLOAT_DATA
+    try:
+        # Load the CSV
+        df = pd.read_csv(RUSSELL_FILE_PATH)
+
+        # Drop empty rows
+        df = df.dropna(subset=["Symbol", "Shr Out less Closely Held Sh"])
+
+        # Build a dictionary where Key = Ticker, Value = Free Float (in millions)
+        for _, row in df.iterrows():
+            ticker = str(row["Symbol"]).strip().upper()
+
+            # Safely convert the float column to a number, ignoring errors/text
+            try:
+                float_val = float(
+                    str(row["Shr Out less Closely Held Sh"]).replace(",", "")
+                )
+                if not math.isnan(float_val):
+                    FREE_FLOAT_DATA[ticker] = float_val
+            except ValueError:
+                continue
+
+        logger.info(f"Loaded free float data for {len(FREE_FLOAT_DATA)} tickers.")
+    except Exception as e:
+        logger.error(f"Failed to load float data: {e}")
+
+
+def load_json_mappings():
+    global CUSIP_TO_CIK, CIK_TO_TICKER, TICKER_TO_CUSIP, CUSIP_TO_TICKER
+    try:
+        with open(CUSIP_TO_CIK_FILE_PATH, "r") as f:
+            CUSIP_TO_CIK = json.load(f)
+        with open(CIK_TO_TICKER_FILE_PATH, "r") as f:
+            CIK_TO_TICKER = json.load(f)
+        with open(TICKER_TO_CUSIP_FILE_PATH, "r") as f:
+            TICKER_TO_CUSIP = json.load(f)
+
+        # Build a safe reverse dictionary (CUSIP -> Ticker)
+        # Because JSON values are lists, we iterate through them safely
+        for ticker, cusip_list in TICKER_TO_CUSIP.items():
+            if isinstance(cusip_list, list):
+                for c in cusip_list:
+                    CUSIP_TO_TICKER[c] = ticker
+            elif isinstance(cusip_list, str):
+                CUSIP_TO_TICKER[cusip_list] = ticker
+
+        logger.info("Loaded JSON mappings for CUSIP<->CIK<->Ticker")
+    except Exception as e:
+        logger.error(f"Failed to load JSON mappings: {e}")
+
+
+load_json_mappings()
+load_float_data()
 
 # Initialize FastAPI app and rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["5/minute"])
@@ -1445,8 +1508,6 @@ def compare_holdings(
         ).head(5)
         top_5_decreased_common = decreased_holdings.sort(by="percent_change").head(5)
 
-        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
-
         def inject_tickers(data_list, cusip_key="cusip"):
             if not data_list:
                 return []
@@ -2108,8 +2169,6 @@ def get_latest_stories_v2(
 
         results = db.fetchall()
 
-        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
-
         story_summaries = []
         for row in results:
             # Common Stock Holdings
@@ -2489,8 +2548,6 @@ def get_latest_activity_v3(
         db.execute(final_query_template, final_query_params)
         results = db.fetchall()
 
-        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
-
         # Serialize into our new HoldingActivity model and inject the ticker
         activities = []
         for row in results:
@@ -2505,6 +2562,231 @@ def get_latest_activity_v3(
 
     except Exception as e:
         logger.error("Failed to fetch latest activity v3", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"An internal error occurred: {str(e)}"
+        )
+
+
+FILTER_CANDIDATES_QUERY_OPTIONS = """
+    SELECT DISTINCT h.filing_id
+    FROM holdings h
+    JOIN put_or_call_table p ON h.put_or_call = p.id
+    WHERE h.filing_id = ANY(%(candidate_filing_ids)s)
+      AND p.name ILIKE ANY(ARRAY['Put', 'Call', 'PUT', 'CALL']);
+"""
+
+LATEST_ACTIVITY_QUERY_OPTIONS = """
+    WITH FilingsWithPrevious AS (
+        SELECT * FROM (VALUES %s) AS t (
+            filing_id, company_id, accession_number, period_of_report, filing_date,
+            created_at,
+            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+        )
+        WHERE filing_id = ANY(%(valid_filing_ids)s)
+    ),
+    AggregatedHoldings AS (
+        SELECT
+            h.filing_id,
+            i.cusip,
+            p.name AS put_or_call,
+            MIN(i.issuer_name) as issuer_name,
+            SUM(h.value) as total_value,
+            SUM(h.shares_or_principal_amount) as total_shares
+        FROM holdings h
+        JOIN issuers i ON h.issuer_id = i.issuer_id
+        JOIN put_or_call_table p ON h.put_or_call = p.id
+        WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
+          AND p.name ILIKE ANY(ARRAY['Put', 'Call', 'PUT', 'CALL'])
+        GROUP BY h.filing_id, i.cusip, p.name
+    ),
+    HoldingsComparison AS (
+        SELECT
+            fwp.filing_id,
+            fwp.aum,
+            fwp.cik_number,
+            fwp.company_name,
+            fwp.accession_number,
+            fwp.previous_accession_number,
+            fwp.period_of_report,
+            fwp.filing_date,
+            fwp.created_at,
+            hc.cusip,
+            hc.put_or_call,
+            hc.issuer_name,
+            hc.current_value,
+            hc.current_shares,
+            hc.previous_value,
+            hc.previous_shares,
+            hc.change_in_share,
+            hc.percent_change,
+            hc.change_type
+        FROM
+            FilingsWithPrevious fwp
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(curr.cusip, prev.cusip) AS cusip,
+                COALESCE(curr.put_or_call, prev.put_or_call) AS put_or_call,
+                COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
+                curr.total_value AS current_value,
+                curr.total_shares AS current_shares,
+                prev.total_value AS previous_value,
+                prev.total_shares AS previous_shares,
+                (curr.total_shares - prev.total_shares) AS change_in_share,
+                CASE
+                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS percent_change,
+                CASE
+                    WHEN prev.cusip IS NULL THEN 'new'
+                    WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN curr.total_shares > prev.total_shares THEN 'increased'
+                    WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                    ELSE 'unchanged'
+                END as change_type
+            FROM
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.filing_id) AS curr
+            FULL OUTER JOIN
+                (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.previous_filing_id) AS prev
+                -- We must join on BOTH cusip and put_or_call to avoid overlapping Puts/Calls
+                ON curr.cusip = prev.cusip AND curr.put_or_call = prev.put_or_call
+            WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
+        ) hc ON true
+        WHERE
+            fwp.previous_filing_id IS NOT NULL
+    )
+    SELECT
+        hc.cik_number AS cik,
+        hc.company_name,
+        hc.accession_number AS latest_accession_number,
+        hc.previous_accession_number,
+        hc.period_of_report AS reporting_period,
+        hc.filing_date,
+        hc.issuer_name,
+        hc.cusip,
+        hc.put_or_call,
+        false AS is_common_stock,
+        hc.change_type,
+        hc.current_shares,
+        hc.previous_shares,
+        hc.change_in_share,
+        ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.current_value,
+        hc.previous_value,
+        ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
+        hc.aum,
+        ROUND(CASE WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares ELSE 0 END, 2) AS current_price_per_share,
+        ROUND(CASE WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares ELSE 0 END, 2) AS previous_price_per_share
+    FROM
+        HoldingsComparison hc
+    WHERE
+        hc.change_type IN ('new', 'closed', 'increased', 'decreased', 'unchanged')
+    ORDER BY
+        hc.filing_date DESC, hc.created_at DESC;
+"""
+
+
+@app.get("/activity/latest/options", response_model=LatestActivityResponse)
+def get_latest_options_activity(
+    request: Request,
+    limit: int = Query(
+        3, description="Number of *companies* to fetch options stories for", ge=1, le=50
+    ),
+    offset: int = Query(
+        0, description="Number of *companies* to skip for pagination", ge=0
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Retrieves a flat list of all significant options (Put/Call) holding changes
+    from the latest batch of company filings.
+    """
+    try:
+        # Step 1: Get candidate companies (paginated)
+        db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
+        candidate_filings = db.fetchall()
+
+        has_next_page = len(candidate_filings) > limit
+        candidates_to_process = candidate_filings[:limit]
+
+        if not candidates_to_process:
+            return LatestActivityResponse(activities=[])
+
+        # Step 2: Filter candidates to only those holding Options (Put/Call)
+        candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
+        params = {
+            "candidate_filing_ids": candidate_filing_ids,
+        }
+        db.execute(FILTER_CANDIDATES_QUERY_OPTIONS, params)
+        valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
+
+        valid_filings = [
+            f for f in candidates_to_process if f["filing_id"] in valid_filing_ids
+        ]
+
+        if not valid_filings:
+            return LatestActivityResponse(activities=[])
+
+        # Step 3: Prepare the VALUES list and parameters for the main query
+        filing_ids_to_process = set()
+        filing_data_tuples = []
+
+        for f in valid_filings:
+            filing_ids_to_process.add(f["filing_id"])
+            if f["previous_filing_id"]:
+                filing_ids_to_process.add(f["previous_filing_id"])
+
+            filing_data_tuples.append(
+                (
+                    f["filing_id"],
+                    f["company_id"],
+                    f["accession_number"],
+                    f["period_of_report"],
+                    f["filing_date"],
+                    f["created_at"],
+                    f["company_name"],
+                    f["cik_number"],
+                    f["aum"],
+                    f["previous_filing_id"],
+                    f["previous_accession_number"],
+                )
+            )
+
+        # Safely create the VALUES string
+        values_string_list = []
+        for t in filing_data_tuples:
+            values_string_list.append(
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode(
+                    "utf-8"
+                )
+            )
+        values_string = ",\n".join(values_string_list)
+
+        # Prepare the final query
+        final_query_template = LATEST_ACTIVITY_QUERY_OPTIONS.replace(
+            "%s", values_string
+        )
+        final_query_params = {
+            "valid_filing_ids": list(valid_filing_ids),
+            "filing_ids_to_process": list(filing_ids_to_process),
+        }
+
+        # Step 4: Execute the query and serialize the results
+        db.execute(final_query_template, final_query_params)
+        results = db.fetchall()
+
+        # Serialize into our HoldingActivity model and inject the ticker
+        activities = []
+        for row in results:
+            activity_dict = dict(row)
+            activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
+            activities.append(HoldingActivity(**activity_dict))
+
+        return LatestActivityResponse(
+            activities=activities, has_next_page=has_next_page
+        )
+
+    except Exception as e:
+        logger.error("Failed to fetch latest options activity", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
@@ -2551,6 +2833,125 @@ def search_companies(
         raise HTTPException(status_code=500, detail="Error during company search")
 
 
+def resolve_identifiers(
+    identifier: str, db: psycopg2.extensions.cursor
+) -> tuple[str | None, str | None]:
+    """
+    Takes an unknown identifier (Ticker or CUSIP) and returns both (ticker, cusip).
+    Implements a multi-tier waterfall lookup to ensure both are found.
+    """
+    clean_id = identifier.strip().upper()
+    ticker = None
+    cusip = None
+
+    is_likely_ticker = len(clean_id) <= 5 and clean_id.isalpha()
+
+    # ---------------------------------------------------------
+    # PATH A: Assume input is a TICKER
+    # ---------------------------------------------------------
+    if clean_id in TICKER_TO_CUSIP:
+        ticker = clean_id
+        # JSON returns a list, extract the first item
+        cusip_list = TICKER_TO_CUSIP[ticker]
+        if cusip_list and isinstance(cusip_list, list):
+            cusip = cusip_list[0]
+        elif isinstance(cusip_list, str):
+            cusip = cusip_list
+
+    elif clean_id in FREE_FLOAT_DATA:
+        ticker = clean_id
+
+    elif is_likely_ticker:
+        ticker = clean_id
+
+    # ---------------------------------------------------------
+    # PATH B: Assume input is a CUSIP
+    # ---------------------------------------------------------
+    else:
+        cusip = clean_id
+
+        # 1. Try reverse lookup using our new global dict
+        if cusip in CUSIP_TO_TICKER:
+            ticker = CUSIP_TO_TICKER[cusip]
+
+        # 2. If no ticker yet, try CUSIP -> CIK -> Ticker (JSON lists)
+        if not ticker:
+            cik_list = CUSIP_TO_CIK.get(cusip)
+            if cik_list and isinstance(cik_list, list) and len(cik_list) > 0:
+                cik_str = str(cik_list[0])  # Extract first CIK
+
+                ticker_list = CIK_TO_TICKER.get(cik_str)
+                if (
+                    ticker_list
+                    and isinstance(ticker_list, list)
+                    and len(ticker_list) > 0
+                ):
+                    ticker = ticker_list[0].upper()  # Extract first Ticker
+
+    # ---------------------------------------------------------
+    # PATH C: DATABASE FALLBACKS
+    # ---------------------------------------------------------
+    try:
+        if cusip and not ticker:
+            db.execute("SELECT symbol FROM issuers WHERE cusip = %s LIMIT 1", (cusip,))
+            db_res = db.fetchone()
+            if db_res and db_res.get("symbol"):
+                ticker = db_res["symbol"].strip().upper()
+
+        elif ticker and not cusip:
+            db.execute("SELECT cusip FROM issuers WHERE symbol = %s LIMIT 1", (ticker,))
+            db_res = db.fetchone()
+            if db_res and db_res.get("cusip"):
+                cusip = db_res["cusip"].strip().upper()
+    except Exception as e:
+        logger.warning(f"Database identifier fallback failed for {clean_id}: {e}")
+
+    return ticker, cusip
+
+
+def get_free_float(ticker: str) -> float | None:
+    """
+    Retrieves free float in millions. Uses the local CSV cache first.
+    If not found, fetches from Yahoo Finance and caches it.
+    """
+    if not ticker:
+        return None
+
+    ticker = ticker.upper()
+
+    # 1. Check local cache (loaded from CSV previously)
+    if ticker in FREE_FLOAT_DATA:
+        return FREE_FLOAT_DATA[ticker]
+
+    # 2. Fallback: Fetch dynamically
+    try:
+        logger.info(f"Ticker {ticker} not in CSV. Fetching float from Yahoo Finance...")
+        stock = yf.Ticker(ticker)
+
+        # Yahoo Finance returns float shares as a raw number (e.g., 50000000)
+        float_shares_raw = stock.info.get("floatShares")
+
+        if float_shares_raw:
+            # Convert to millions to match your CSV format
+            float_in_millions = float_shares_raw / 1_000_000.0
+
+            # Cache it so we don't hit the API again for this ticker
+            FREE_FLOAT_DATA[ticker] = float_in_millions
+            logger.info(
+                f"Successfully fetched and cached float for {ticker}: {float_in_millions}M"
+            )
+            return float_in_millions
+        else:
+            logger.warning(f"Yahoo Finance has no float data for {ticker}.")
+            # Cache a None or 0 to prevent repeated failed API calls?
+            # For now, we just return None.
+            return None
+
+    except Exception as e:
+        logger.error(f"Error fetching float for {ticker} via yfinance: {e}")
+        return None
+
+
 @app.get("/api/v1/flow/daily/{identifier}", response_model=DailyFlowResponse)
 def get_daily_stock_flow(
     request: Request,
@@ -2562,21 +2963,16 @@ def get_daily_stock_flow(
     Aggregates buying/selling flow based on the FILING DATE.
     This shows 'what was reported today' rather than 'what happened in Q3'.
     """
-    # Clean the input and make uppercase to match our dictionary keys
-    identifier_clean = identifier.strip().upper()
+    ticker, clean_cusip = resolve_identifiers(identifier, db)
 
-    ticker = None
-    if identifier_clean in TICKER_TO_CUSIP:
-        ticker = identifier_clean
-        clean_cusip = TICKER_TO_CUSIP[identifier_clean]
-    else:
-        clean_cusip = identifier_clean
-        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
-        if clean_cusip in CUSIP_TO_TICKER:
-            ticker = CUSIP_TO_TICKER[clean_cusip]
+    if not clean_cusip:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not resolve {identifier} to a valid CUSIP for analysis.",
+        )
 
-    logger.debug(
-        f"Received request for identifier: {identifier}, resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
+    logger.info(
+        f"Daily Flow: Requested {identifier} -> Resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
     )
 
     start_date = dt.date.today() - dt.timedelta(days=days)
@@ -2650,9 +3046,6 @@ def get_daily_stock_flow(
     try:
         # Pass params: start_date, then cusip twice (for current and prev join)
         db.execute(query, (start_date, clean_cusip, clean_cusip))
-        logger.debug(
-            f"Executed daily flow query for CUSIP {clean_cusip} starting from {start_date}"
-        )
         results = db.fetchall()
 
         daily_data = [
@@ -2665,8 +3058,22 @@ def get_daily_stock_flow(
             for row in results
         ]
 
+        free_float_shares = None
+
+        if ticker:
+            float_in_millions = get_free_float(ticker)
+            if float_in_millions and float_in_millions > 0:
+                free_float_shares = float_in_millions * 1_000_000
+                for entry in daily_data:
+                    entry.net_change_pct_float = (
+                        entry.net_change / free_float_shares
+                    ) * 100
+
         return DailyFlowResponse(
-            ticker=ticker, cusip=clean_cusip, daily_data=daily_data
+            ticker=ticker,
+            cusip=clean_cusip,
+            free_float_shares=free_float_shares,
+            daily_data=daily_data,
         )
 
     except Exception as e:
@@ -2687,21 +3094,16 @@ def get_aggregate_stock_flow(
     """
     Aggregates total buying/selling flow over the last X days into a single summary.
     """
-    # Clean the input and map to CUSIP
-    identifier_clean = identifier.strip().upper()
+    ticker, clean_cusip = resolve_identifiers(identifier, db)
 
-    ticker = None
-    if identifier_clean in TICKER_TO_CUSIP:
-        ticker = identifier_clean
-        clean_cusip = TICKER_TO_CUSIP[identifier_clean]
-    else:
-        clean_cusip = identifier_clean
-        CUSIP_TO_TICKER = {v: k for k, v in TICKER_TO_CUSIP.items()}
-        if clean_cusip in CUSIP_TO_TICKER:
-            ticker = CUSIP_TO_TICKER[clean_cusip]
+    if not clean_cusip:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not resolve {identifier} to a valid CUSIP for analysis.",
+        )
 
-    logger.debug(
-        f"Received aggregate request for identifier: {identifier}, resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
+    logger.info(
+        f"Daily Flow: Requested {identifier} -> Resolved Ticker: {ticker}, CUSIP: {clean_cusip}"
     )
 
     start_date = dt.date.today() - dt.timedelta(days=days)
@@ -2753,17 +3155,44 @@ def get_aggregate_stock_flow(
     SELECT
         COALESCE(SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END), 0) as total_gross_buying,
         COALESCE(SUM(CASE WHEN current_shares < previous_shares THEN ABS(current_shares - previous_shares) ELSE 0 END), 0) as total_gross_selling,
-        COALESCE(SUM(current_shares - previous_shares), 0) as total_net_change
+        COALESCE(SUM(current_shares - previous_shares), 0) as total_net_change,
+        COALESCE(SUM(previous_shares), 0) as total_previous_shares
     FROM HoldingsComparison;
     """
 
     try:
         db.execute(query, (start_date, clean_cusip, clean_cusip))
-        logger.debug(
-            f"Executed aggregate flow query for CUSIP {clean_cusip} starting from {start_date}"
-        )
-
         result = db.fetchone()
+
+        if not result:
+            return AggregateFlowResponse(
+                ticker=ticker,
+                cusip=clean_cusip,
+                days_looked_back=days,
+                gross_buying=0.0,
+                gross_selling=0.0,
+                net_change=0.0,
+                net_change_pct_float=None,
+                percent_change=None,
+                free_float_shares=None,
+            )
+
+        net_change_val = float(result["total_net_change"])
+        total_previous = float(result["total_previous_shares"])
+        net_change_pct = None
+        percent_change = None
+        free_float_shares = None
+
+        # --- 3. FREE FLOAT CALCULATION (Using ticker) ---
+        if ticker:
+            float_in_millions = get_free_float(ticker)
+            if float_in_millions and float_in_millions > 0:
+                free_float_shares = float_in_millions * 1_000_000
+                net_change_pct = (net_change_val / free_float_shares) * 100
+
+        # --- 4. PERCENT INCREASE/DECREASE CALCULATION ---
+        if total_previous > 0:
+            percent_change = (net_change_val / total_previous) * 100
 
         return AggregateFlowResponse(
             ticker=ticker,
@@ -2771,7 +3200,10 @@ def get_aggregate_stock_flow(
             days_looked_back=days,
             gross_buying=float(result["total_gross_buying"]),
             gross_selling=float(result["total_gross_selling"]),
-            net_change=float(result["total_net_change"]),
+            net_change=net_change_val,
+            net_change_pct_float=net_change_pct,
+            percent_change=percent_change,
+            free_float_shares=free_float_shares,
         )
 
     except Exception as e:
