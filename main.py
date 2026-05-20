@@ -3035,7 +3035,8 @@ def get_daily_stock_flow(
         filing_date,
         SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END) as gross_buying,
         SUM(CASE WHEN current_shares < previous_shares THEN ABS(current_shares - previous_shares) ELSE 0 END) as gross_selling,
-        SUM(current_shares - previous_shares) as net_change
+        SUM(current_shares - previous_shares) as net_change,
+        SUM(previous_shares) as total_previous_shares
     FROM HoldingsComparison
     GROUP BY filing_date
     ORDER BY filing_date DESC;
@@ -3046,15 +3047,30 @@ def get_daily_stock_flow(
         db.execute(query, (clean_cusip, start_date))
         results = db.fetchall()
 
-        daily_data = [
-            DailyFlowEntry(
-                date=row["filing_date"],
-                gross_buying=float(row["gross_buying"]),
-                gross_selling=float(row["gross_selling"]),
-                net_change=float(row["net_change"]),
+        daily_data = []
+        for row in results:
+            # Safely handle nulls if there were no previous shares
+            prev_shares = (
+                float(row["total_previous_shares"])
+                if row["total_previous_shares"]
+                else 0.0
             )
-            for row in results
-        ]
+            net_change = float(row["net_change"])
+
+            pct_change = None
+            if prev_shares > 0:
+                pct_change = (net_change / prev_shares) * 100
+
+            daily_data.append(
+                DailyFlowEntry(
+                    date=row["filing_date"],
+                    gross_buying=float(row["gross_buying"]),
+                    gross_selling=float(row["gross_selling"]),
+                    net_change=net_change,
+                    percent_change=pct_change,
+                    net_change_pct_float=None,  # Handled below
+                )
+            )
 
         free_float_shares = None
 

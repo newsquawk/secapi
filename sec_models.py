@@ -106,6 +106,7 @@ class DailyFlowEntry(BaseModel):
     gross_selling: float
     net_change: float
     net_change_pct_float: Optional[float] = None
+    percent_change: Optional[float] = None
 
 
 class DailyFlowResponse(BaseModel):
