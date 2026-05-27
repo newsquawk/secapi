@@ -33,6 +33,8 @@ from sec_models import (
     DailyFlowResponse,
     HoldingsRequest,
     AggregateFlowResponse,
+    TopStockChangeEntry,
+    TopStockChangesResponse,
 )
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
@@ -3415,6 +3417,145 @@ def search_filings_by_aum(
     except Exception as e:
         logger.error(f"Error searching filings by AUM: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/v1/flow/top-changes", response_model=TopStockChangesResponse)
+def get_top_market_changes_today(
+    request: Request,
+    date: Optional[dt.date] = Query(
+        None, description="Target filing date (YYYY-MM-DD). Defaults to today."
+    ),
+    sort_by: str = Query(
+        "value", description="Sort by 'value' (dollar change) or 'shares' (share count)"
+    ),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Retrieves the top 50 stocks with the largest absolute net change across
+    all institutional 13F filings processed on a specific date.
+    """
+    target_date = date or dt.date.today()
+
+    if sort_by not in ["value", "shares"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid sort_by option. Use 'value' or 'shares'."
+        )
+
+    # Determine safe SQL ordering expression based on choice
+    order_by_clause = (
+        "ABS(SUM(hc.value_change))"
+        if sort_by == "value"
+        else "ABS(SUM(hc.share_change))"
+    )
+
+    query = f"""
+    WITH RelevantFilings AS (
+        -- 1. Grab all filings that hit the system on the specified date
+        SELECT f.filing_id, f.company_id, f.filing_date, f.period_of_report
+        FROM filings f
+        WHERE f.filing_date = %(date)s
+          AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+    ),
+    PreviousFilings AS (
+        -- 2. Find the immediate previous filing for each company
+        SELECT
+            rf.filing_id AS current_filing_id,
+            (
+                SELECT f2.filing_id
+                FROM filings f2
+                WHERE f2.company_id = rf.company_id
+                  AND f2.period_of_report < rf.period_of_report
+                  AND f2.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+                ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
+                LIMIT 1
+            ) AS previous_filing_id
+        FROM RelevantFilings rf
+    ),
+    HoldingsComparison AS (
+        -- 3. Side-by-side position changes per company, filtering for Common Stock 
+        -- and applying your 1000x correction multiplier for low-price entries
+        SELECT
+            hc.issuer_id,
+            (hc.current_shares - hc.previous_shares) AS share_change,
+            (hc.current_value - hc.previous_value) AS value_change,
+            CASE WHEN hc.current_shares > hc.previous_shares THEN (hc.current_shares - hc.previous_shares) ELSE 0 END AS buying_shares,
+            CASE WHEN hc.current_shares < hc.previous_shares THEN (hc.previous_shares - hc.current_shares) ELSE 0 END AS selling_shares
+        FROM RelevantFilings rf
+        JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(curr.issuer_id, prev.issuer_id) AS issuer_id,
+                COALESCE(curr.shares_or_principal_amount, 0) AS current_shares,
+                COALESCE(prev.shares_or_principal_amount, 0) AS previous_shares,
+                COALESCE(curr.value, 0) AS current_value,
+                COALESCE(prev.value, 0) AS previous_value
+            FROM (
+                SELECT h.issuer_id, h.shares_or_principal_amount, 
+                       CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END as value 
+                FROM holdings h
+                JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                WHERE h.filing_id = pf.current_filing_id
+                  AND tc.name ~* %(common_stock_pattern)s
+            ) curr
+            FULL OUTER JOIN (
+                SELECT h.issuer_id, h.shares_or_principal_amount, 
+                       CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END as value 
+                FROM holdings h
+                JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                WHERE h.filing_id = pf.previous_filing_id
+                  AND tc.name ~* %(common_stock_pattern)s
+            ) prev ON curr.issuer_id = prev.issuer_id
+        ) hc ON TRUE
+    )
+    -- 4. Roll up entries market-wide per stock issuer
+    SELECT
+        i.issuer_name,
+        i.cusip,
+        i.symbol AS ticker,
+        SUM(hc.share_change) AS net_shares_change,
+        SUM(hc.value_change) AS net_value_change,
+        SUM(ABS(hc.value_change)) AS absolute_value_change,
+        SUM(hc.buying_shares) AS gross_buying_shares,
+        SUM(hc.selling_shares) AS gross_selling_shares
+    FROM HoldingsComparison hc
+    JOIN issuers i ON hc.issuer_id = i.issuer_id
+    GROUP BY i.issuer_id, i.issuer_name, i.cusip, i.symbol
+    ORDER BY {order_by_clause} DESC
+    LIMIT 50;
+    """
+
+    try:
+        db.execute(
+            query,
+            {"date": target_date, "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS},
+        )
+        results = db.fetchall()
+
+        stocks_data = []
+        for row in results:
+            stocks_data.append(
+                TopStockChangeEntry(
+                    issuer_name=row["issuer_name"],
+                    cusip=row["cusip"],
+                    # Fall back onto your JSON cross-map memory dictionary if DB ticker is null
+                    ticker=row["ticker"] or CUSIP_TO_TICKER.get(row["cusip"]),
+                    net_shares_change=float(row["net_shares_change"]),
+                    net_value_change=float(row["net_value_change"]),
+                    absolute_value_change=float(row["absolute_value_change"]),
+                    gross_buying_shares=float(row["gross_buying_shares"]),
+                    gross_selling_shares=float(row["gross_selling_shares"]),
+                )
+            )
+
+        return TopStockChangesResponse(
+            date=target_date, sort_by=sort_by, stocks=stocks_data
+        )
+
+    except Exception as e:
+        logger.error(f"Error compiling top market stock flows: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Database aggregation error: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

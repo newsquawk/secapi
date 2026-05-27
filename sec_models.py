@@ -126,3 +126,20 @@ class AggregateFlowResponse(BaseModel):
     net_change_pct_float: Optional[float] = None
     percent_change: Optional[float] = None
     free_float_shares: Optional[float] = None
+
+
+class TopStockChangeEntry(BaseModel):
+    issuer_name: str
+    cusip: str
+    ticker: Optional[str] = None
+    net_shares_change: float
+    net_value_change: float
+    absolute_value_change: float
+    gross_buying_shares: float
+    gross_selling_shares: float
+
+
+class TopStockChangesResponse(BaseModel):
+    date: dt.date
+    sort_by: str
+    stocks: List[TopStockChangeEntry]
