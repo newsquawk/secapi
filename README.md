@@ -79,12 +79,21 @@ The API provides a comprehensive set of endpoints to query and analyze filing da
 The application is configured using environment variables. You can create a `.env` file in the root directory or export them in your shell.
 
 ```
+# Runtime
+APP_ENV=production                 # default; enforces fail-fast config checks in production
+DEBUG=false                         # set "true"/"1" to enable debug mode and stack traces
+ENABLE_DOCS=false                   # set "true" to expose /docs, /redoc, /openapi.json
+ALLOWED_HOSTS=                      # optional comma-separated Host allowlist
+
 # Database Connection
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=sec
 DB_USER=postgres
-DB_PASSWORD=password
+DB_PASSWORD=                        # REQUIRED when APP_ENV=production
+DB_CONNECT_TIMEOUT=10               # seconds
+DB_SSLMODE=prefer                   # prefer | require | verify-full
+DB_KEEPALIVE_IDLE=30                # seconds
 
 # SEC EDGAR Identity (for any direct API calls)
 EDGAR_IDENTITY="Your Name or Company your.email@example.com"
@@ -101,8 +110,13 @@ CORS_ORIGINS="http://localhost:5000,http://127.0.0.1:5000"
 Start the server using Uvicorn:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# Local development (skips production config checks)
+APP_ENV=development uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+In production (`APP_ENV=production`, the default), the app **fails fast at startup** if `DB_PASSWORD` is not set, and interactive docs (`/docs`, `/redoc`) are disabled unless `ENABLE_DOCS=true`.
+
+A liveness probe is available at `GET /health` (used by the container `HEALTHCHECK`).
 
 _`main` is the name of your Python file (e.g., `main.py`)._
 

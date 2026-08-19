@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.DS_Store
+env
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+*.tar.gz
+.cmd
+.command
+test_api.py
+README.md

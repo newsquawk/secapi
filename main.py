@@ -1,5 +1,5 @@
 import psycopg2
-from fastapi import FastAPI, Depends, HTTPException, Query, Body, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, Request, Header
 import os
 import uvicorn
 import polars as pl
@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from fastapi import HTTPException
 from psycopg2.extras import RealDictCursor
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 import datetime as dt
@@ -154,22 +155,64 @@ def load_json_mappings():
 load_json_mappings()
 load_float_data()
 
+from contextlib import asynccontextmanager
+
+# ---------------------------------------------------------------------------
+# Runtime configuration
+# ---------------------------------------------------------------------------
+APP_ENV = os.getenv("APP_ENV", "production").lower().strip()
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
+ENABLE_DOCS = DEBUG or os.getenv("ENABLE_DOCS", "false").lower() in ("1", "true", "yes", "on")
+
+INTERNAL_ERROR_DETAIL = "An internal error occurred. Please try again later."
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def validate_production_config() -> None:
+    if APP_ENV == "production":
+        _require_env("DB_PASSWORD")
+    if not os.getenv("CORS_ORIGINS"):
+        logger.warning("CORS_ORIGINS is not set; cross-origin requests will be blocked.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_production_config()
+    logger.info("secapi starting")
+    yield
+    logger.info("secapi shutting down")
+
+
 # Initialize FastAPI app and rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["20/minute"])
-app = FastAPI(title="SEC API", version="1.0.0", debug=True)
+
+app = FastAPI(
+    title="SEC API",
+    version="1.0.0",
+    debug=DEBUG,
+    lifespan=lifespan,
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
+)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# CORS configuration
+# CORS configuration (explicit allowlist; empty list => no cross-origin requests)
 origins_env = os.environ.get("CORS_ORIGINS", "").split(",")
 allow_origins = [origin.strip() for origin in origins_env if origin.strip()]
 logger.info(
-    f"CORS allowed origins: {allow_origins if allow_origins else 'All origins allowed'}"
+    f"CORS allowed origins: {allow_origins if allow_origins else '<none> (cross-origin requests blocked)'}"
 )
 
-# If no origins are specified, allow all (not recommended for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,  # Your frontend origins
@@ -178,24 +221,51 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
+# Host-header validation. Only enforced when ALLOWED_HOSTS is configured.
+allowed_hosts_env = os.getenv("ALLOWED_HOSTS", "")
+allowed_hosts = [h.strip() for h in allowed_hosts_env.split(",") if h.strip()]
+if allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    logger.info(f"Trusted hosts: {allowed_hosts}")
+
+
+# Baseline security headers on every response.
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-XSS-Protection", "0")
+    return response
+
 
 def get_db_connection():
     """
     Establishes and returns a new PostgreSQL database connection.
+    No insecure fallback credentials are used in production.
     """
     try:
+        if APP_ENV == "production":
+            db_password = _require_env("DB_PASSWORD")
+        else:
+            db_password = os.getenv("DB_PASSWORD", "")
+
         conn = psycopg2.connect(
             host=os.getenv("DB_HOST", "localhost"),
             database=os.getenv("DB_NAME", "sec"),
             user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", "password"),
+            password=db_password,
             port=os.getenv("DB_PORT", "5432"),
+            connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+            sslmode=os.getenv("DB_SSLMODE", "prefer"),
+            keepalives=1,
+            keepalives_idle=int(os.getenv("DB_KEEPALIVE_IDLE", "30")),
         )
         return conn
-    except psycopg2.OperationalError as e:
-        logger.error(f"Database connection failed: {e}", exc_info=True)
-        # Raise an exception that FastAPI can handle
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {e}")
+    except psycopg2.Error:
+        logger.error("Database connection failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 def get_db_cursor():
@@ -215,6 +285,12 @@ def get_db_cursor():
 @app.get("/")
 def read_root(request: Request):
     return {"message": "Welcome to the SEC API"}
+
+
+@app.get("/health")
+def health():
+    """Liveness probe for load balancers and container healthchecks."""
+    return {"status": "ok"}
 
 
 def _format_address(
@@ -258,8 +334,8 @@ def _format_address(
 def get_managers(
     request: Request,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     """
     Retrieve all managers with pagination
@@ -395,7 +471,7 @@ def get_manager(
         return manager_data
     except Exception as e:
         logger.error(f"Error fetching manager with CIK {cik}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/managers/{cik}/filings")
@@ -486,7 +562,7 @@ def get_manager_filings(
             f"Error fetching filings for manager with CIK {cik}: {str(e)}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/filings/", response_model=dict)
@@ -620,7 +696,7 @@ def get_filings(
 
     except Exception as e:
         logger.error(f"Error fetching filings: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/filings/{accession_number}", response_model=dict)
@@ -668,7 +744,7 @@ def get_filing_by_accession(
             f"Error fetching filing with accession number {accession_number}: {e}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/holdings/{accession_number}", response_model=dict)
@@ -678,9 +754,9 @@ def get_holding_by_accession_number(
     # limit: int = Query(100, ge=1, le=1000),
     # offset: int = Query(0, ge=0),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
-    draw: int = Query(0, alias="draw"),
-    start: int = Query(0, alias="start"),
-    length: int = Query(10, alias="length"),
+    draw: int = Query(0, ge=0, alias="draw"),
+    start: int = Query(0, ge=0, alias="start"),
+    length: int = Query(10, ge=-1, le=1000, alias="length"),
     search_value: Optional[str] = Query(None, alias="search[value]"),
     order_column_index: int = Query(0, alias="order[0][column]"),
     order_dir: str = Query("asc", alias="order[0][dir]"),
@@ -706,6 +782,9 @@ def get_holding_by_accession_number(
         }
         order_by_column = column_map.get(order_column_index, "h.value")
         order_direction = "DESC" if order_dir == "desc" else "ASC"
+
+        # DataTables sends length=-1 for "Show all"; map it to a safe internal cap.
+        effective_length = 5000 if length == -1 else length
 
         # Base query to get the total count of all records (before any filtering)
         count_query = """
@@ -769,7 +848,7 @@ def get_holding_by_accession_number(
             ORDER BY {order_by_column} {order_direction}
             OFFSET %s LIMIT %s;
         """
-        query_params = search_params + [start, length]
+        query_params = search_params + [start, effective_length]
         logger.info(
             f"Executing holdings query for accession_number={accession_number} with search='{search_value}', order_by='{order_by_column} {order_direction}', start={start}, length={length}"
         )
@@ -812,7 +891,7 @@ def get_holding_by_accession_number(
             f"Error fetching holdings for accession number {accession_number}: {e}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.post("/api/ai_summary")
@@ -1636,7 +1715,7 @@ def compare_holdings(
         raise
     except Exception as e:
         logger.error(f"An unexpected error occurred: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/comparisons", response_model=list)
@@ -1661,7 +1740,7 @@ def get_recent_comparisons(
         return comparisons
     except Exception as e:
         logger.error(f"Error fetching recent comparisons: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 class ComparisonRequest(BaseModel):
@@ -1686,7 +1765,7 @@ def save_comparison(
         return {"message": "Comparison saved successfully"}
     except Exception as e:
         logger.error(f"Error saving comparison: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 def api_save_comparison(accession_1: str, accession_2: str, db):
@@ -1701,7 +1780,7 @@ def api_save_comparison(accession_1: str, accession_2: str, db):
         return {"message": "Comparison saved successfully"}
     except Exception as e:
         logger.error(f"Error saving comparison: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/company/{cik}/compare/latest")
@@ -1764,7 +1843,7 @@ def compare_latest_filings(
             f"Error comparing latest filings for CIK {cik}: {str(e)}", exc_info=True
         )
         raise HTTPException(
-            status_code=500, detail=f"An unexpected error occurred: {str(e)}"
+            status_code=500, detail=INTERNAL_ERROR_DETAIL
         )
 
 
@@ -2320,7 +2399,7 @@ def get_latest_stories_v2(
     except Exception as e:
         logger.error(f"Error fetching latest stories v2: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"An internal error occurred: {str(e)}"
+            status_code=500, detail=INTERNAL_ERROR_DETAIL
         )
 
 
@@ -2565,7 +2644,7 @@ def get_latest_activity_v3(
     except Exception as e:
         logger.error("Failed to fetch latest activity v3", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"An internal error occurred: {str(e)}"
+            status_code=500, detail=INTERNAL_ERROR_DETAIL
         )
 
 
@@ -2790,7 +2869,7 @@ def get_latest_options_activity(
     except Exception as e:
         logger.error("Failed to fetch latest options activity", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"An internal error occurred: {str(e)}"
+            status_code=500, detail=INTERNAL_ERROR_DETAIL
         )
 
 
@@ -3097,7 +3176,7 @@ def get_daily_stock_flow(
             f"Error fetching daily stock flow for identifier {identifier}: {str(e)}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/api/v1/flow/aggregate/{identifier}", response_model=AggregateFlowResponse)
@@ -3232,7 +3311,7 @@ def get_aggregate_stock_flow(
             f"Error fetching aggregate stock flow for identifier {identifier}: {str(e)}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/api/v1/search/companies_by_aum", response_model=list[dict])
@@ -3289,7 +3368,7 @@ def search_companies_by_aum(
 
     except Exception as e:
         logger.error(f"Error searching companies by AUM: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/api/v1/search/filings_by_aum", response_model=dict)
@@ -3416,7 +3495,7 @@ def search_filings_by_aum(
 
     except Exception as e:
         logger.error(f"Error searching filings by AUM: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
 @app.get("/api/v1/flow/top-changes", response_model=TopStockChangesResponse)
@@ -3554,7 +3633,7 @@ def get_top_market_changes_today(
     except Exception as e:
         logger.error(f"Error compiling top market stock flows: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=500, detail=f"Database aggregation error: {str(e)}"
+            status_code=500, detail=INTERNAL_ERROR_DETAIL
         )
 
 
