@@ -94,6 +94,8 @@ DB_PASSWORD=                        # REQUIRED when APP_ENV=production
 DB_CONNECT_TIMEOUT=10               # seconds
 DB_SSLMODE=prefer                   # prefer | require | verify-full
 DB_KEEPALIVE_IDLE=30                # seconds
+DB_POOL_MIN_CONN=4                  # minimum pooled connections
+DB_POOL_MAX_CONN=20                 # maximum pooled connections
 
 # SEC EDGAR Identity (for any direct API calls)
 EDGAR_IDENTITY="Your Name or Company your.email@example.com"

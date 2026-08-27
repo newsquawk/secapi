@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 from fastapi import HTTPException
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool, PoolError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from typing import List, Dict, Optional
@@ -183,12 +184,72 @@ def validate_production_config() -> None:
         logger.warning("CORS_ORIGINS is not set; cross-origin requests will be blocked.")
 
 
+DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "4"))
+DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "20"))
+db_pool: Optional[ThreadedConnectionPool] = None
+
+
+def _get_db_connection_params() -> dict:
+    if APP_ENV == "production":
+        db_password = _require_env("DB_PASSWORD")
+    else:
+        db_password = os.getenv("DB_PASSWORD", "")
+
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "database": os.getenv("DB_NAME", "sec"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": db_password,
+        "port": os.getenv("DB_PORT", "5432"),
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+        "sslmode": os.getenv("DB_SSLMODE", "prefer"),
+        "keepalives": 1,
+        "keepalives_idle": int(os.getenv("DB_KEEPALIVE_IDLE", "30")),
+    }
+
+
+def init_db_pool() -> None:
+    """Initializes the ThreadedConnectionPool on application startup."""
+    global db_pool
+    if db_pool is not None:
+        return
+    try:
+        params = _get_db_connection_params()
+        db_pool = ThreadedConnectionPool(
+            minconn=DB_POOL_MIN_CONN,
+            maxconn=DB_POOL_MAX_CONN,
+            **params,
+        )
+        logger.info(
+            f"Initialized database connection pool (min={DB_POOL_MIN_CONN}, max={DB_POOL_MAX_CONN})"
+        )
+    except psycopg2.Error:
+        logger.error("Failed to initialize database connection pool", exc_info=True)
+        if APP_ENV == "production":
+            raise
+
+
+def close_db_pool() -> None:
+    """Closes all connections in the pool on application shutdown."""
+    global db_pool
+    if db_pool is not None:
+        try:
+            db_pool.closeall()
+            logger.info("Closed all connections in database pool")
+        except Exception:
+            logger.error("Error closing database connection pool", exc_info=True)
+        finally:
+            db_pool = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_production_config()
     logger.info("secapi starting")
+    init_db_pool()
     yield
     logger.info("secapi shutting down")
+    close_db_pool()
 
 
 # Initialize FastAPI app and rate limiter
@@ -244,27 +305,12 @@ async def add_security_headers(request: Request, call_next):
 
 def get_db_connection():
     """
-    Establishes and returns a new PostgreSQL database connection.
-    No insecure fallback credentials are used in production.
+    Establishes and returns a new direct PostgreSQL database connection.
+    Maintained for standalone operations and fallbacks.
     """
     try:
-        if APP_ENV == "production":
-            db_password = _require_env("DB_PASSWORD")
-        else:
-            db_password = os.getenv("DB_PASSWORD", "")
-
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            database=os.getenv("DB_NAME", "sec"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=db_password,
-            port=os.getenv("DB_PORT", "5432"),
-            connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
-            sslmode=os.getenv("DB_SSLMODE", "prefer"),
-            keepalives=1,
-            keepalives_idle=int(os.getenv("DB_KEEPALIVE_IDLE", "30")),
-        )
-        return conn
+        params = _get_db_connection_params()
+        return psycopg2.connect(**params)
     except psycopg2.Error:
         logger.error("Database connection failed", exc_info=True)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
@@ -272,16 +318,70 @@ def get_db_connection():
 
 def get_db_cursor():
     """
-    Dependency that yields a database cursor and ensures the connection
-    is properly managed.
+    Dependency that yields a database cursor backed by a connection from the pool
+    and ensures the connection is cleanly returned with rollback on error.
     """
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    global db_pool
+    conn = None
+    cursor = None
+    is_pooled = False
+
+    # Attempt to initialize pool if not already initialized
+    if db_pool is None:
+        try:
+            init_db_pool()
+        except Exception:
+            pass
+
+    if db_pool is not None:
+        try:
+            conn = db_pool.getconn()
+            is_pooled = True
+        except PoolError:
+            logger.error("Database connection pool exhausted", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection pool exhausted. Please retry shortly.",
+            )
+        except psycopg2.Error:
+            logger.error("Failed to acquire connection from pool", exc_info=True)
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
+    else:
+        # Fallback to direct connection if pool could not be initialized
+        conn = get_db_connection()
+
     try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         yield cursor
+    except Exception:
+        if conn and not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
     finally:
-        cursor.close()
-        conn.close()
+        if cursor and not cursor.closed:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            if is_pooled and db_pool is not None:
+                if not conn.closed:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                try:
+                    db_pool.putconn(conn)
+                except Exception:
+                    logger.error("Failed to return connection to pool", exc_info=True)
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 @app.get("/")
