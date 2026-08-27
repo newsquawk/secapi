@@ -1168,6 +1168,7 @@ HOLDINGS_QUERY = """
         h.holding_id,
         i.issuer_name,
         t.name AS title_of_class,
+        COALESCE(t.is_common_stock, FALSE) AS is_common_stock,
         h.shares_or_principal_amount,
         s.name AS shares_or_principal_type,
         h.value,
@@ -1192,6 +1193,7 @@ HOLDINGS_SCHEMA = {
     "holding_id": pl.Int64,
     "issuer_name": pl.Utf8,
     "title_of_class": pl.Utf8,
+    "is_common_stock": pl.Boolean,
     "shares_or_principal_amount": pl.Int64,
     "shares_or_principal_type": pl.Utf8,
     "value": pl.Int64,
@@ -1236,11 +1238,7 @@ def _process_filings(
         requires_multiplication = True
 
     updated_df = (
-        df_with_prices.filter(
-            pl.col("title_of_class")
-            .str.to_uppercase()
-            .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
-        )
+        df_with_prices.filter(pl.col("is_common_stock"))
         .with_columns(
             pl.col("issuer_name")
             .str.strip_chars()
@@ -1384,17 +1382,8 @@ def compare_holdings(
         )
 
         # other securities (non-common stock)
-        latest_other_securities = latest_df.filter(
-            ~pl.col("title_of_class")
-            .str.to_uppercase()
-            .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
-        )
-
-        prev_other_securities = previous_df.filter(
-            ~pl.col("title_of_class")
-            .str.to_uppercase()
-            .str.contains(COMMON_STOCK_TITLE_OF_CLASS)
-        )
+        latest_other_securities = latest_df.filter(~pl.col("is_common_stock"))
+        prev_other_securities = previous_df.filter(~pl.col("is_common_stock"))
 
         # Data cleaning and aggregation for latest other securities
         latest_other_aggregated = (
@@ -2080,7 +2069,7 @@ FILTER_CANDIDATES_QUERY_V2 = """
     JOIN title_of_class_table tc ON h.title_of_class = tc.id
     WHERE
         h.filing_id = ANY(%(candidate_filing_ids)s)
-      AND tc.name ~* %(common_stock_pattern)s;
+      AND tc.is_common_stock = TRUE;
 """
 
 MODIFIED_OPTIMISED_STORIES_QUERY = """
@@ -2099,14 +2088,14 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares,
-            (tc.name ~* %(common_stock_pattern)s) as is_common_stock
+            tc.is_common_stock
         FROM holdings h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
           AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
-        GROUP BY h.filing_id, i.cusip, is_common_stock
+        GROUP BY h.filing_id, i.cusip, tc.is_common_stock
     ),
     HoldingsComparison AS (
         SELECT
@@ -2553,14 +2542,14 @@ LATEST_ACTIVITY_QUERY_V3 = """
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares,
-            (tc.name ~* %(common_stock_pattern)s) as is_common_stock
+            tc.is_common_stock
         FROM holdings h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
           AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
-        GROUP BY h.filing_id, i.cusip, is_common_stock
+        GROUP BY h.filing_id, i.cusip, tc.is_common_stock
     ),
     HoldingsComparison AS (
         SELECT
@@ -3710,7 +3699,7 @@ def get_top_market_changes_today(
                 FROM holdings h
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.current_filing_id
-                  AND tc.name ~* %(common_stock_pattern)s
+                  AND tc.is_common_stock = TRUE
             ) curr
             FULL OUTER JOIN (
                 SELECT h.issuer_id, h.shares_or_principal_amount, 
@@ -3718,7 +3707,7 @@ def get_top_market_changes_today(
                 FROM holdings h
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.previous_filing_id
-                  AND tc.name ~* %(common_stock_pattern)s
+                  AND tc.is_common_stock = TRUE
             ) prev ON curr.issuer_id = prev.issuer_id
         ) hc ON TRUE
     )
