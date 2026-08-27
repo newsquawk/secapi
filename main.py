@@ -41,6 +41,8 @@ from sec_models import (
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
+# put_or_call names that denote derivative option positions (excluded from comparisons)
+OPTION_PUT_CALL_NAMES = frozenset({"PUT", "CALL"})
 
 FREE_FLOAT_DATA = {}
 CUSIP_TO_CIK = {}
@@ -1257,6 +1259,15 @@ def compare_holdings(
         else:
             latest_df = pl.DataFrame(latest_holdings_data, schema=HOLDINGS_SCHEMA)
 
+        # Exclude derivative option (Put/Call) positions from the comparison entirely.
+        # This is applied at the source so options never appear in the common-stock
+        # bucket either (option rows in 13F data often carry a 'COM'-style title).
+        _is_option_row = pl.col("put_or_call").is_not_null() & pl.col(
+            "put_or_call"
+        ).str.to_uppercase().is_in(OPTION_PUT_CALL_NAMES)
+        previous_df = previous_df.filter(~_is_option_row)
+        latest_df = latest_df.filter(~_is_option_row)
+
         # Data cleaning and aggregation + filter ONLY COMMON STOCK
         latest_aggregated, latest_multiplication = _process_filings(latest_df)
         prev_aggregated, prev_multiplication = _process_filings(
@@ -1971,7 +1982,9 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         FROM holdings h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
+          AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
         GROUP BY h.filing_id, i.cusip, is_common_stock
     ),
     HoldingsComparison AS (
@@ -2423,7 +2436,9 @@ LATEST_ACTIVITY_QUERY_V3 = """
         FROM holdings h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
+          AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
         GROUP BY h.filing_id, i.cusip, is_common_stock
     ),
     HoldingsComparison AS (
