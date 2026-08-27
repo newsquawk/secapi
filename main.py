@@ -2021,25 +2021,39 @@ WITH RankedFilings AS (
         f.period_of_report,
         f.filing_date,
         f.created_at,
-        c.company_name,
-        c.cik_number,
-        c.aum,
         ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn
     FROM
         filings f
-    JOIN
-        companies c ON f.company_id = c.company_id
     WHERE
         f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
 ),
 LatestFilings AS (
-    SELECT * FROM RankedFilings WHERE rn = 1
+    SELECT
+        filing_id,
+        company_id,
+        accession_number,
+        period_of_report,
+        filing_date,
+        created_at
+    FROM RankedFilings
+    WHERE rn = 1
+    ORDER BY filing_date DESC, created_at DESC
+    LIMIT %(limit)s OFFSET %(offset)s
 )
 SELECT
-    lf.*,
+    lf.filing_id,
+    lf.company_id,
+    lf.accession_number,
+    lf.period_of_report,
+    lf.filing_date,
+    lf.created_at,
+    c.company_name,
+    c.cik_number,
+    c.aum,
     pf.filing_id AS previous_filing_id,
     pf.accession_number AS previous_accession_number
 FROM LatestFilings lf
+JOIN companies c ON lf.company_id = c.company_id
 LEFT JOIN LATERAL (
     SELECT filing_id, accession_number
     FROM filings
@@ -2049,8 +2063,7 @@ LEFT JOIN LATERAL (
     ORDER BY period_of_report DESC, filing_date DESC
     LIMIT 1
 ) pf ON true
-ORDER BY lf.filing_date DESC, lf.created_at DESC
-LIMIT %(limit)s OFFSET %(offset)s;
+ORDER BY lf.filing_date DESC, lf.created_at DESC;
 """
 
 FILTER_CANDIDATES_QUERY_V2 = """
