@@ -708,28 +708,36 @@ def get_filings(
             # Logic: If we sort by AUM, we only want the LATEST filing for each company.
             # Otherwise, we see the same company listed 20 times with the same AUM.
 
-            # 1. Count unique companies (instead of total filings)
-            count_query = "SELECT COUNT(DISTINCT company_id) as count FROM filings"
+            # 1. Fast count of unique companies that have filings via index seek
+            count_query = """
+                SELECT COUNT(*) as count 
+                FROM companies c 
+                WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
+            """
             db.execute(count_query)
             total_count = db.fetchone()["count"]
 
-            # 2. Query for Distinct Latest Filings sorted by AUM
-            # We use DISTINCT ON to grab the latest, then wrap it to sort by AUM.
+            # 2. Query for Latest Filings sorted by Company AUM using index-driven lateral scan
             filings_query = f"""
-                WITH LatestFilings AS (
-                    SELECT DISTINCT ON (f.company_id)
-                        f.accession_number, f.form_type, f.filing_date, f.period_of_report,
-                        f.file_number, f.filing_directory, f.created_at, f.updated_at,
-                        c.company_name, c.cik_number, c.aum
+                SELECT
+                    lf.accession_number, lf.form_type, lf.filing_date, lf.period_of_report,
+                    lf.file_number, lf.filing_directory, lf.created_at, lf.updated_at,
+                    c.company_name, c.cik_number, c.aum
+                FROM (
+                    SELECT company_id, company_name, cik_number, aum
+                    FROM companies c
+                    WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
+                    ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST, company_name ASC
+                    LIMIT %s OFFSET %s
+                ) c
+                CROSS JOIN LATERAL (
+                    SELECT f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                           f.file_number, f.filing_directory, f.created_at, f.updated_at
                     FROM filings f
-                    LEFT JOIN companies c ON f.company_id = c.company_id
-                    -- Internal Sort: Ensure we grab the latest filing for the distinct logic
-                    ORDER BY f.company_id, f.filing_date DESC, f.accession_number DESC
-                )
-                SELECT * FROM LatestFilings
-                -- Final Sort: Order the distinct list by AUM
-                ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST
-                LIMIT %s OFFSET %s
+                    WHERE f.company_id = c.company_id
+                    ORDER BY f.filing_date DESC, f.accession_number DESC
+                    LIMIT 1
+                ) lf
             """
             logger.info(
                 f"Executing filings query with AUM sorting, limit={limit}, offset={offset}"
