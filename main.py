@@ -896,43 +896,71 @@ def get_holding_by_accession_number(
         # DataTables sends length=-1 for "Show all"; map it to a safe internal cap.
         effective_length = 5000 if length == -1 else length
 
-        # Base query to get the total count of all records (before any filtering)
-        count_query = """
-            SELECT COUNT(*)
-            FROM holdings h
-            INNER JOIN filings f ON h.filing_id = f.filing_id
-            WHERE f.accession_number = %s;
-        """
-        db.execute(count_query, (accession_number,))
+        # 1. Fast lookup of filing_id using idx_filings_accession
+        db.execute(
+            "SELECT filing_id FROM filings WHERE accession_number = %s LIMIT 1",
+            (accession_number,),
+        )
+        filing_row = db.fetchone()
+        if not filing_row:
+            return {
+                "draw": draw,
+                "recordsTotal": 0,
+                "recordsFiltered": 0,
+                "data": [],
+            }
+
+        filing_id = filing_row["filing_id"]
+
+        # 2. Count total holdings records using idx_holdings_filing_id (no table join needed)
+        count_query = "SELECT COUNT(*) FROM holdings WHERE filing_id = %s;"
+        db.execute(count_query, (filing_id,))
         total_records = db.fetchone()["count"]  # type: ignore
 
-        # Construct the WHERE clause for searching
-        where_clause = "WHERE f.accession_number = %s"
-        search_params = [accession_number]
-        if search_value:
-            where_clause += """
-                AND (
-                    i.issuer_name ILIKE %s OR
-                    i.cusip ILIKE %s OR
-                    t.name ILIKE %s
-                )
+        if total_records == 0:
+            return {
+                "draw": draw,
+                "recordsTotal": 0,
+                "recordsFiltered": 0,
+                "data": [],
+            }
+
+        # 3. Construct search filter if requested, or short-circuit if not searching
+        if search_value and search_value.strip():
+            search_pattern = f"%{search_value.strip()}%"
+            filtered_count_query = """
+                SELECT COUNT(*)
+                FROM holdings h
+                LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
+                LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
+                WHERE h.filing_id = %s
+                  AND (
+                      i.issuer_name ILIKE %s OR
+                      i.cusip ILIKE %s OR
+                      t.name ILIKE %s
+                  );
             """
-            search_pattern = f"%{search_value}%"
-            search_params.extend([search_pattern, search_pattern, search_pattern])
+            db.execute(
+                filtered_count_query,
+                (filing_id, search_pattern, search_pattern, search_pattern),
+            )
+            filtered_records = db.fetchone()["count"]
 
-        # Query to get the count after applying the search filter
-        filtered_count_query = f"""
-            SELECT COUNT(*)
-            FROM holdings h
-            INNER JOIN filings f ON h.filing_id = f.filing_id
-            LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
-            LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
-            {where_clause};
-        """
-        db.execute(filtered_count_query, search_params)
-        filtered_records = db.fetchone()["count"]
+            where_clause = """
+                WHERE h.filing_id = %s
+                  AND (
+                      i.issuer_name ILIKE %s OR
+                      i.cusip ILIKE %s OR
+                      t.name ILIKE %s
+                  )
+            """
+            search_params = [filing_id, search_pattern, search_pattern, search_pattern]
+        else:
+            filtered_records = total_records
+            where_clause = "WHERE h.filing_id = %s"
+            search_params = [filing_id]
 
-        # Main query to fetch the paginated, filtered, and sorted data
+        # 4. Main query to fetch the paginated, filtered, and sorted data using direct filing_id seek
         holdings_query = f"""
             SELECT
                 h.holding_id,
@@ -948,7 +976,6 @@ def get_holding_by_accession_number(
                 h.voting_authority_none,
                 i.cusip
             FROM holdings h
-            INNER JOIN filings f ON h.filing_id = f.filing_id
             LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
             LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
             LEFT JOIN share_type_table s ON h.shares_or_principal_type = s.id
@@ -1237,8 +1264,12 @@ def _process_filings(
     if median_price is not None and median_price < 2.0:  # Threshold of $2.00
         requires_multiplication = True
 
+    _is_option = pl.col("put_or_call").is_not_null() & pl.col(
+        "put_or_call"
+    ).str.to_uppercase().is_in(OPTION_PUT_CALL_NAMES)
+
     updated_df = (
-        df_with_prices.filter(pl.col("is_common_stock"))
+        df_with_prices.filter(pl.col("is_common_stock") & ~_is_option)
         .with_columns(
             pl.col("issuer_name")
             .str.strip_chars()
@@ -1365,15 +1396,6 @@ def compare_holdings(
         else:
             latest_df = pl.DataFrame(latest_holdings_data, schema=HOLDINGS_SCHEMA)
 
-        # Exclude derivative option (Put/Call) positions from the comparison entirely.
-        # This is applied at the source so options never appear in the common-stock
-        # bucket either (option rows in 13F data often carry a 'COM'-style title).
-        _is_option_row = pl.col("put_or_call").is_not_null() & pl.col(
-            "put_or_call"
-        ).str.to_uppercase().is_in(OPTION_PUT_CALL_NAMES)
-        previous_df = previous_df.filter(~_is_option_row)
-        latest_df = latest_df.filter(~_is_option_row)
-
         # Data cleaning and aggregation + filter ONLY COMMON STOCK
         latest_aggregated, latest_multiplication = _process_filings(latest_df)
         prev_aggregated, prev_multiplication = _process_filings(
@@ -1381,9 +1403,17 @@ def compare_holdings(
             latest=False,
         )
 
-        # other securities (non-common stock)
-        latest_other_securities = latest_df.filter(~pl.col("is_common_stock"))
-        prev_other_securities = previous_df.filter(~pl.col("is_common_stock"))
+        # other securities (non-common stock OR derivative options)
+        _is_option = pl.col("put_or_call").is_not_null() & pl.col(
+            "put_or_call"
+        ).str.to_uppercase().is_in(OPTION_PUT_CALL_NAMES)
+
+        latest_other_securities = latest_df.filter(
+            ~pl.col("is_common_stock") | _is_option
+        )
+        prev_other_securities = previous_df.filter(
+            ~pl.col("is_common_stock") | _is_option
+        )
 
         # Data cleaning and aggregation for latest other securities
         latest_other_aggregated = (
@@ -3009,24 +3039,44 @@ def search_companies(
     """
     Search for companies by name or CIK for autocomplete.
     """
-    if len(q) < 2:
+    clean_q = q.strip()
+    if len(clean_q) < 2:
         return []
 
-    search_name = f"%{q}%"
-    search_cik = f"{q}%"  # CIKs are usually searched from the start
-
-    query = """
-        SELECT
-            company_name,
-            cik_number
-        FROM companies
-        WHERE
-            company_name ILIKE %s
-            OR cik_number::text ILIKE %s
-        LIMIT 10;
-    """
     try:
-        db.execute(query, (search_name, search_cik))
+        if clean_q.isdigit():
+            # Numeric query: search by CIK prefix or exact CIK, plus company name check
+            search_cik = f"{clean_q}%"
+            search_name = f"%{clean_q}%"
+            query = """
+                (
+                    SELECT company_name, cik_number
+                    FROM companies
+                    WHERE cik_number::text LIKE %s
+                    ORDER BY cik_number ASC
+                    LIMIT 10
+                )
+                UNION
+                (
+                    SELECT company_name, cik_number
+                    FROM companies
+                    WHERE company_name ILIKE %s
+                    LIMIT 10
+                )
+                LIMIT 10;
+            """
+            db.execute(query, (search_cik, search_name))
+        else:
+            # Text query: pure company name search using GIN trigram index
+            search_name = f"%{clean_q}%"
+            query = """
+                SELECT company_name, cik_number
+                FROM companies
+                WHERE company_name ILIKE %s
+                LIMIT 10;
+            """
+            db.execute(query, (search_name,))
+
         results = db.fetchall()
 
         companies = [
