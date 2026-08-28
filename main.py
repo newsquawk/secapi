@@ -2807,8 +2807,10 @@ FILTER_CANDIDATES_QUERY_OPTIONS = """
     SELECT DISTINCT h.filing_id
     FROM holdings h
     JOIN put_or_call_table p ON h.put_or_call = p.id
+    JOIN issuers i ON h.issuer_id = i.issuer_id
     WHERE h.filing_id = ANY(%(candidate_filing_ids)s)
-      AND p.name ILIKE ANY(ARRAY['Put', 'Call', 'PUT', 'CALL']);
+      AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+      {cusip_filter};
 """
 
 LATEST_ACTIVITY_QUERY_OPTIONS = """
@@ -2832,7 +2834,8 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN put_or_call_table p ON h.put_or_call = p.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
-          AND p.name ILIKE ANY(ARRAY['Put', 'Call', 'PUT', 'CALL'])
+          AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+          {cusip_filter}
         GROUP BY h.filing_id, i.cusip, p.name
     ),
     HoldingsComparison AS (
@@ -2915,7 +2918,8 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
     FROM
         HoldingsComparison hc
     WHERE
-        hc.change_type IN ('new', 'closed', 'increased', 'decreased', 'unchanged')
+        hc.change_type = ANY(%(allowed_change_types)s)
+        {min_value_filter}
     ORDER BY
         hc.filing_date DESC, hc.created_at DESC;
 """
@@ -2925,34 +2929,107 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
 def get_latest_options_activity(
     request: Request,
     limit: int = Query(
-        3, description="Number of *companies* to fetch options stories for", ge=1, le=50
+        10, description="Number of *companies* to fetch options trades for", ge=1, le=50
     ),
     offset: int = Query(
         0, description="Number of *companies* to skip for pagination", ge=0
     ),
+    ticker: Optional[str] = Query(
+        None, description="Filter by underlying stock ticker or CUSIP (e.g. AAPL, NVDA)"
+    ),
+    put_or_call: Optional[str] = Query(
+        None, description="Filter by option contract type ('PUT' or 'CALL')"
+    ),
+    change_type: Optional[str] = Query(
+        None,
+        description="Filter by trade type ('new', 'closed', 'increased', 'decreased')",
+    ),
+    min_value: Optional[float] = Query(
+        None,
+        description="Filter by minimum absolute dollar value change",
+        ge=0,
+    ),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
-    Retrieves a flat list of all significant options (Put/Call) holding changes
-    from the latest batch of company filings.
+    Retrieves a flat list of institutional options (Put/Call) trades
+    (new, closed, increased, decreased) from the latest batch of company filings,
+    with optional filtering by ticker, option type, trade type, and minimum value.
     """
+    actual_limit = limit if isinstance(limit, int) else 10
+    actual_offset = offset if isinstance(offset, int) else 0
+
+    # 1. Validate and process put_or_call
+    if put_or_call is not None and isinstance(put_or_call, str):
+        poc_clean = put_or_call.strip().upper()
+        if poc_clean == "PUT":
+            put_or_call_patterns = ["Put", "PUT"]
+        elif poc_clean == "CALL":
+            put_or_call_patterns = ["Call", "CALL"]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid put_or_call filter. Use 'PUT' or 'CALL'.",
+            )
+    else:
+        put_or_call_patterns = ["Put", "Call", "PUT", "CALL"]
+
+    # 2. Validate and process change_type
+    valid_change_types = {"new", "closed", "increased", "decreased"}
+    if change_type is not None and isinstance(change_type, str):
+        ct_clean = change_type.strip().lower()
+        if ct_clean not in valid_change_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid change_type '{change_type}'. Allowed values: {', '.join(sorted(valid_change_types))}.",
+            )
+        allowed_change_types = [ct_clean]
+    else:
+        allowed_change_types = ["new", "closed", "increased", "decreased"]
+
+    # 3. Validate and resolve ticker / CUSIP
+    target_cusip = None
+    if ticker is not None and isinstance(ticker, str):
+        _, resolved_cusip = resolve_identifiers(ticker, db)
+        if not resolved_cusip:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not resolve identifier '{ticker}' to a valid CUSIP.",
+            )
+        target_cusip = resolved_cusip
+
+    cusip_filter = "AND i.cusip = %(target_cusip)s" if target_cusip else ""
+    actual_min_value = min_value if isinstance(min_value, (int, float)) else None
+    min_value_filter = (
+        "AND ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) >= %(min_value)s"
+        if actual_min_value is not None
+        else ""
+    )
+
     try:
         # Step 1: Get candidate companies (paginated)
-        db.execute(FILING_QUERY_V2, {"limit": limit + 1, "offset": offset})
+        db.execute(FILING_QUERY_V2, {"limit": actual_limit + 1, "offset": actual_offset})
         candidate_filings = db.fetchall()
 
-        has_next_page = len(candidate_filings) > limit
-        candidates_to_process = candidate_filings[:limit]
+        has_next_page = len(candidate_filings) > actual_limit
+        candidates_to_process = candidate_filings[:actual_limit]
 
         if not candidates_to_process:
             return LatestActivityResponse(activities=[])
 
-        # Step 2: Filter candidates to only those holding Options (Put/Call)
+        # Step 2: Filter candidates to only those holding Options (Put/Call) matching criteria
         candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
+        filter_candidates_query = FILTER_CANDIDATES_QUERY_OPTIONS.format(
+            cusip_filter=cusip_filter
+        )
         params = {
             "candidate_filing_ids": candidate_filing_ids,
+            "put_or_call_patterns": put_or_call_patterns,
         }
-        db.execute(FILTER_CANDIDATES_QUERY_OPTIONS, params)
+        if target_cusip:
+            params["target_cusip"] = target_cusip
+
+        db.execute(filter_candidates_query, params)
         valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
 
         valid_filings = [
@@ -2998,13 +3075,20 @@ def get_latest_options_activity(
         values_string = ",\n".join(values_string_list)
 
         # Prepare the final query
-        final_query_template = LATEST_ACTIVITY_QUERY_OPTIONS.replace(
-            "%s", values_string
-        )
+        final_query_template = LATEST_ACTIVITY_QUERY_OPTIONS.format(
+            cusip_filter=cusip_filter, min_value_filter=min_value_filter
+        ).replace("%s", values_string)
+
         final_query_params = {
             "valid_filing_ids": list(valid_filing_ids),
             "filing_ids_to_process": list(filing_ids_to_process),
+            "put_or_call_patterns": put_or_call_patterns,
+            "allowed_change_types": allowed_change_types,
         }
+        if target_cusip:
+            final_query_params["target_cusip"] = target_cusip
+        if actual_min_value is not None:
+            final_query_params["min_value"] = actual_min_value
 
         # Step 4: Execute the query and serialize the results
         db.execute(final_query_template, final_query_params)
@@ -3021,6 +3105,8 @@ def get_latest_options_activity(
             activities=activities, has_next_page=has_next_page
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to fetch latest options activity", exc_info=True)
         raise HTTPException(
