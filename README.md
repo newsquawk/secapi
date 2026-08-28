@@ -1,132 +1,246 @@
-Here is a README for your FastAPI application, formatted for GitHub.
-
 # SEC Filings Analysis API 📊
 
-This project is a high-performance backend API built with **FastAPI** to serve and analyze SEC 13F filing data. It connects to a PostgreSQL database, performs complex data analysis using **Polars**, and provides structured JSON endpoints for a web frontend.
-
-The API is designed to deliver insights into investment managers' portfolios, track changes over time, and even generate AI-powered summaries of significant activity.
+A high-performance backend API built with **FastAPI** to serve and analyze SEC Form 13F filing data. It connects to a PostgreSQL database, executes fast data manipulation with **Polars**, and provides structured JSON endpoints for web frontends, market research tools, and institutional flow analysis.
 
 ---
 
-## ✨ Features & Endpoints
+## 📑 Table of Contents
+- [✨ Key Features & Feeds](#-key-features--feeds)
+- [📡 API Endpoints Reference](#-api-endpoints-reference)
+  - [1. Activity Feeds & Story Streams](#1-activity-feeds--story-streams)
+  - [2. Institutional Flow & Market Leaderboards](#2-institutional-flow--market-leaderboards)
+  - [3. Manager & Company Endpoints](#3-manager--company-endpoints)
+  - [4. Filings & Detailed Holdings](#4-filings--detailed-holdings)
+  - [5. Portfolio Comparison & Analysis](#5-portfolio-comparison--analysis)
+  - [6. AI Summaries & Health Check](#6-ai-summaries--health-check)
+- [🛠️ Technology Stack](#️-technology-stack)
+- [🚀 Getting Started](#-getting-started)
+- [⚙️ Configuration](#️-configuration)
+- [📚 Interactive API Documentation](#-interactive-api-documentation)
 
-The API provides a comprehensive set of endpoints to query and analyze filing data:
+---
 
-- **Manager & Filing Data**
+## ✨ Key Features & Feeds
 
-  - `GET /managers/`: Retrieves a paginated list of all investment managers.
-  - `GET /managers/{cik}`: Fetches detailed information for a single manager by their CIK.
-  - `GET /managers/{cik}/filings`: Lists all historical filings for a specific manager.
-  - `GET /filings/`: Returns a paginated and sortable list of all recent filings from all managers.
-  - `GET /filings/{accession_number}`: Gets metadata for a single filing by its accession number.
+- **Options Radar (`/activity/latest/options`)**: Tracks institutional Put & Call options trades (new positions, closed positions, increases, decreases) with filtering by ticker, contract type, action, and dollar value.
+- **Stock Activity Feed (`/activity/latest/v3`)**: Flat stream of common stock portfolio changes across recently processed 13F filings.
+- **Curated Stories (`/stories/latest/v2`)**: Generates structured summary cards showing top position changes for each filing.
+- **Institutional Flow Analysis (`/api/v1/flow/...`)**: Aggregates net buying/selling pressure per stock with percentage of free float calculations.
+- **Portfolio Diffing (`/analysis/...`)**: Instant side-by-side analysis between any two 13F filing periods.
 
-- **Detailed Holdings**
+---
 
-  - `GET /holdings/{accession_number}`: Provides detailed holdings for a specific filing, with server-side pagination, searching, and sorting compatible with the DataTables.js library.
+## 📡 API Endpoints Reference
 
-- **Portfolio Comparison & Analysis**
+### 1. Activity Feeds & Story Streams
 
-  - `GET /analysis/{prev_accession}/{latest_accession}`: The core analysis endpoint. Compares two filings and returns a detailed breakdown of portfolio changes (new, closed, increased, decreased, and unchanged positions) for both common stock and other securities.
-  - `GET /company/{cik}/compare/latest`: A convenience endpoint to automatically compare the two most recent filings for a given CIK.
+#### `GET /activity/latest/options` — Institutional Options Trades Feed
+Retrieves institutional Put and Call trades from the latest batch of 13F filings. Excludes static/unchanged positions.
+* **Query Parameters**:
+  * `ticker` *(string, optional)*: Filter by stock ticker or CUSIP (e.g. `NVDA`, `AAPL`).
+  * `put_or_call` *(string, optional)*: Filter by contract type (`PUT` or `CALL`).
+  * `change_type` *(string, optional)*: Filter by action (`new`, `closed`, `increased`, `decreased`).
+  * `min_value` *(float, optional)*: Filter by minimum absolute trade value change (e.g. `10000000` for $10M+).
+  * `limit` *(int, default=10, 1-50)*: Number of fund filings to fetch.
+  * `offset` *(int, default=0)*: Number of fund filings to skip.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/activity/latest/options?ticker=TSLA&put_or_call=CALL&change_type=new"
+  ```
 
-- **AI-Powered Summaries**
+#### `GET /activity/latest/v3` — Common Stock Activity Stream
+Retrieves a flat list of individual Common Stock position changes across the latest batch of filings.
+* **Query Parameters**:
+  * `limit` *(int, default=3, 1-50)*: Number of company filings to fetch.
+  * `offset` *(int, default=0)*: Number of company filings to skip.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/activity/latest/v3?limit=10"
+  ```
 
-  - `POST /api/ai_summary`: Accepts portfolio change data and uses the DeepSeek API to generate a concise, human-readable summary of the most significant changes.
+#### `GET /stories/latest/v2` — Curated Story Highlights Feed
+Aggregates recent filings into structured story cards highlighting top new, closed, increased, and decreased positions for both common stock and options.
+* **Query Parameters**:
+  * `limit` *(int, default=20, 1-50)*: Number of stories to return.
+  * `offset` *(int, default=0)*: Number of stories to skip.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/stories/latest/v2?limit=15"
+  ```
 
-- **Curated "Stories"**
+---
 
-  - `GET /stories/latest/`: A high-level endpoint that automatically finds recent filings, compares them to their predecessors, and identifies the most significant portfolio changes to create a "story" feed.
+### 2. Institutional Flow & Market Leaderboards
+
+#### `GET /api/v1/flow/daily/{identifier}` — Daily Stock Flow Time Series
+Aggregates institutional buying and selling volume grouped by **filing date** for a specific ticker or CUSIP, including net change as a percentage of free float.
+* **Path Parameters**: `identifier` (e.g. `AAPL` or `037833100`).
+* **Query Parameters**: `days` *(int, default=1, 1-365)*: Number of lookback days.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/api/v1/flow/daily/NVDA?days=30"
+  ```
+
+#### `GET /api/v1/flow/aggregate/{identifier}` — Aggregate Stock Flow Summary
+Returns a single consolidated summary of total buying, selling, and net flow over a given lookback window.
+* **Path Parameters**: `identifier` (e.g. `MSFT` or `594918104`).
+* **Query Parameters**: `days` *(int, default=14, 1-365)*: Number of lookback days.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/api/v1/flow/aggregate/MSFT?days=14"
+  ```
+
+#### `GET /api/v1/flow/top-changes` — Top Market Changes Leaderboard
+Retrieves the top 50 stocks with the largest absolute net movement across all 13F filings submitted on a target filing date.
+* **Query Parameters**:
+  * `date` *(YYYY-MM-DD, optional)*: Target filing date (defaults to today).
+  * `sort_by` *(string, default="value")*: Sort by dollar value (`value`) or share volume (`shares`).
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/api/v1/flow/top-changes?sort_by=value&date=2026-02-14"
+  ```
+
+---
+
+### 3. Manager & Company Endpoints
+
+#### `GET /managers/` — List Investment Managers
+Returns a paginated list of all investment managers.
+* **Query Parameters**: `limit` *(default=100)*, `offset` *(default=0)*.
+* **Example**: `curl "http://localhost:8000/managers/?limit=50"`
+
+#### `GET /managers/{cik}` — Manager Metadata
+Fetches detailed profile information for a specific manager by their CIK number.
+* **Example**: `curl "http://localhost:8000/managers/0001067983"`
+
+#### `GET /managers/{cik}/filings` — Manager Historical Filings
+Lists all historical 13F filings for a specific manager CIK.
+* **Example**: `curl "http://localhost:8000/managers/0001067983/filings"`
+
+#### `GET /api/search/companies` — Autocomplete Search
+Fast search for investment managers/companies by name prefix or CIK.
+* **Query Parameters**: `q` *(string, required, min length 2)*.
+* **Example**: `curl "http://localhost:8000/api/search/companies?q=Berkshire"`
+
+#### `GET /api/v1/search/companies_by_aum` — Managers Ranked by AUM
+Paginated list of investment managers ordered by total Assets Under Management.
+* **Query Parameters**: `limit` *(default=20)*, `offset` *(default=0)*.
+
+#### `GET /api/v1/search/filings_by_aum` — Filings Filtered by AUM Range
+Searches filings from managers whose AUM falls within a specified minimum and maximum bracket.
+* **Query Parameters**: `min_aum` *(optional)*, `max_aum` *(optional)*, `limit` *(default=20)*, `offset` *(default=0)*.
+
+---
+
+### 4. Filings & Detailed Holdings
+
+#### `GET /filings/` — Master Filings Stream
+Returns a paginated and sortable list of all processed 13F filings.
+* **Query Parameters**:
+  * `sort_by` *(default="filing_date")*: `filing_date`, `aum`, `company_name`, `cik_number`, `form_type`, `period_of_report`, `created_at`.
+  * `sort_order` *(default="desc")*: `asc` or `desc`.
+  * `limit` *(default=100, 1-100)*, `offset` *(default=0)*.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/filings/?sort_by=aum&sort_order=desc&limit=25"
+  ```
+
+#### `GET /filings/{accession_number}` — Single Filing Details
+Returns metadata for a specific filing by its SEC accession number.
+* **Example**: `curl "http://localhost:8000/filings/0001067983-26-000012"`
+
+#### `GET /holdings/{accession_number}` — Detailed Holdings (DataTables.js Compatible)
+Provides paginated, searchable, and sortable holdings data within a specific filing.
+* **Query Parameters**: `start` *(int)*, `length` *(int)*, `search[value]` *(string)*, `order[0][column]` *(int)*, `order[0][dir]` *(asc/desc)*.
+* **Example**: `curl "http://localhost:8000/holdings/0001067983-26-000012?start=0&length=50"`
+
+---
+
+### 5. Portfolio Comparison & Analysis
+
+#### `GET /analysis/{previous_accession}/{latest_accession}` — Two-Filing Portfolio Comparison
+Compares two filings for a manager and returns a comprehensive breakdown of changes:
+* **Common Stock**: `new_holdings`, `closed_positions`, `increased_holdings`, `decreased_holdings`, `unchanged_holdings`.
+* **Other Securities / Options**: `new_other_securities`, `closed_other_securities`, `increased_other_securities`, `decreased_other_securities`, `unchanged_other_securities`.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/analysis/0001067983-25-000098/0001067983-26-000012"
+  ```
+
+#### `GET /company/{cik}/compare/latest` — Automatic Latest Comparison
+Convenience endpoint that automatically resolves and compares the two most recent filings for a given manager CIK.
+* **Example**: `curl "http://localhost:8000/company/0001067983/compare/latest"`
+
+---
+
+### 6. AI Summaries & Health Check
+
+#### `POST /api/ai_summary` — AI Portfolio Summary
+Accepts portfolio changes payload and generates an executive summary using DeepSeek LLM.
+* **Request Body**: `{"new_holdings": [...], "closed_positions": [...], "increased_holdings": [...], "decreased_holdings": [...]}`.
+
+#### `GET /health` — Liveness Probe
+Returns `{"status": "ok", "environment": "production"}`. Used by load balancers and container health checks.
 
 ---
 
 ## 🛠️ Technology Stack
 
 - **Framework**: [FastAPI](https://fastapi.tiangolo.com/)
-- **Database**: PostgreSQL
-- **DB Driver**: [Psycopg2](https://www.psycopg.org/docs/)
-- **Data Analysis**: [Polars](https://pola.rs/)
-- **Web Server**: [Uvicorn](https://www.uvicorn.org/)
-- **AI Integration**: [OpenAI Python SDK](https://github.com/openai/openai-python) (for DeepSeek)
-- **Data Validation**: [Pydantic](https://www.google.com/search?q=https://docs.pydantic.dev/)
+- **Database**: PostgreSQL (with connection pooling via `psycopg2.pool.ThreadedConnectionPool`)
+- **Data Engine**: [Polars](https://pola.rs/) & [Pandas](https://pandas.pydata.org/)
+- **ASGI Server**: [Uvicorn](https://www.uvicorn.org/)
+- **AI Integration**: [OpenAI Python SDK](https://github.com/openai/openai-python) (DeepSeek backend)
+- **Validation**: [Pydantic v2](https://docs.pydantic.dev/)
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-
-- Python 3.8+
-- A running PostgreSQL database with the required schema.
-- Access to the DeepSeek API (optional, for AI summaries).
+- Python 3.10+
+- PostgreSQL database populated with SEC 13F filing tables.
+- DeepSeek API Key (optional, for `/api/ai_summary`).
 
 ### Installation
-
-1.  **Clone the repository:**
-
-    ```bash
-    git clone https://github.com/JasonLing95/secapi.git
-    cd secapi
-    ```
-
-2.  **Install dependencies:**
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### Configuration
-
-The application is configured using environment variables. You can create a `.env` file in the root directory or export them in your shell.
-
-```
-# Runtime
-APP_ENV=production                 # default; enforces fail-fast config checks in production
-DEBUG=false                         # set "true"/"1" to enable debug mode and stack traces
-ENABLE_DOCS=false                   # set "true" to expose /docs, /redoc, /openapi.json
-ALLOWED_HOSTS=                      # optional comma-separated Host allowlist
-
-# Database Connection
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=sec
-DB_USER=postgres
-DB_PASSWORD=                        # REQUIRED when APP_ENV=production
-DB_CONNECT_TIMEOUT=10               # seconds
-DB_SSLMODE=prefer                   # prefer | require | verify-full
-DB_KEEPALIVE_IDLE=30                # seconds
-DB_POOL_MIN_CONN=4                  # minimum pooled connections
-DB_POOL_MAX_CONN=20                 # maximum pooled connections
-
-# SEC EDGAR Identity (for any direct API calls)
-EDGAR_IDENTITY="Your Name or Company your.email@example.com"
-
-# DeepSeek API Key (optional, for AI summaries)
-DEEPSEEK_API_KEY="your-deepseek-api-key"
-
-# CORS Origins (comma-separated URLs of your frontend)
-CORS_ORIGINS="http://localhost:5000,http://127.0.0.1:5000"
-```
-
-### Running the API
-
-Start the server using Uvicorn:
-
 ```bash
-# Local development (skips production config checks)
+git clone https://github.com/JasonLing95/secapi.git
+cd secapi
+pip install -r requirements.txt
+```
+
+### Running Locally
+```bash
 APP_ENV=development uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-In production (`APP_ENV=production`, the default), the app **fails fast at startup** if `DB_PASSWORD` is not set, and interactive docs (`/docs`, `/redoc`) are disabled unless `ENABLE_DOCS=true`.
+---
 
-A liveness probe is available at `GET /health` (used by the container `HEALTHCHECK`).
+## ⚙️ Configuration
 
-_`main` is the name of your Python file (e.g., `main.py`)._
+Create a `.env` file or export the following environment variables:
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `APP_ENV` | `production` | `production` (strict config validation) or `development` |
+| `DEBUG` | `false` | Enable verbose error traces |
+| `ENABLE_DOCS` | `false` | Enable `/docs` and `/redoc` in production |
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_NAME` | `sec` | Database name |
+| `DB_USER` | `postgres` | Database username |
+| `DB_PASSWORD` | *(required in prod)* | Database password |
+| `DB_POOL_MIN_CONN` | `4` | Minimum database pool connections |
+| `DB_POOL_MAX_CONN` | `20` | Maximum database pool connections |
+| `DEEPSEEK_API_KEY` | `null` | API key for AI summary endpoint |
+| `CORS_ORIGINS` | `""` | Comma-separated allowed frontend origins |
 
 ---
 
-## 📚 API Documentation
+## 📚 Interactive API Documentation
 
-Interactive docs are generated by FastAPI and are available only when `ENABLE_DOCS=true` (or `DEBUG=true`). In production they are **disabled by default**, so `/docs` and `/redoc` return `404` unless explicitly enabled. Once enabled, you can access them at:
+Interactive Swagger and ReDoc documentation are generated by FastAPI:
+- **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
 
-- **Swagger UI**: [http://localhost:8000/docs](https://www.google.com/search?q=http://localhost:8000/docs)
-- **ReDoc**: [http://localhost:8000/redoc](https://www.google.com/search?q=http://localhost:8000/redoc)
+*(In production, enable documentation by setting `ENABLE_DOCS=true`)*
