@@ -35,17 +35,81 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
 ### 1. Activity Feeds & Story Streams
 
 #### `GET /activity/latest/options` — Institutional Options Trades Feed
-Retrieves institutional Put and Call trades from the latest batch of 13F filings. Excludes static/unchanged positions.
+Retrieves institutional Put and Call trades from the latest batch of 13F filings. Excludes static/unchanged positions. Rows are aggregated per **filing × underlying security (CUSIP) × contract type**, so a fund holding both Puts and Calls on the same underlying ticker returns two rows.
 * **Query Parameters**:
   * `ticker` *(string, optional)*: Filter by stock ticker or CUSIP (e.g. `NVDA`, `AAPL`).
   * `put_or_call` *(string, optional)*: Filter by contract type (`PUT` or `CALL`).
   * `change_type` *(string, optional)*: Filter by action (`new`, `closed`, `increased`, `decreased`).
-  * `min_value` *(float, optional)*: Filter by minimum absolute trade value change (e.g. `10000000` for $10M+).
-  * `limit` *(int, default=10, 1-50)*: Number of fund filings to fetch.
+  * `min_value` *(float, optional)*: Filter by minimum absolute dollar value change. Compared against values expressed in **thousands of dollars** (see Units below), e.g. `10000` ≈ $10M+.
+  * `limit` *(int, default=10, 1-50)*: Number of fund filings to fetch (not the number of trade rows).
   * `offset` *(int, default=0)*: Number of fund filings to skip.
+* **Response envelope**: `{ "activities": [ ... ], "has_next_page": boolean }`. `has_next_page` is `true` when more filings exist beyond the current `limit` / `offset` window.
+* **`activities[]` object fields**:
+
+  > 💡 **Consumer quick-reference** — the fields covering the "ticker / name / put-or-call / value / shares" contract are `ticker`, `issuer_name`, `put_or_call`, `current_value` / `previous_value` / `absolute_value_change`, and `current_shares` / `previous_shares` / `change_in_share`.
+
+  | Field | Type | Description |
+  | :--- | :--- | :--- |
+  | `cik` | string | CIK of the filing investment manager |
+  | `company_name` | string | Manager / fund name |
+  | `aum` | integer \| null | Manager's assets under management |
+  | `latest_accession_number` | string | Accession number of the latest filing |
+  | `previous_accession_number` | string \| null | Accession number of the previous filing |
+  | `reporting_period` | date (`YYYY-MM-DD`) | Period of report of the latest filing |
+  | `filing_date` | date (`YYYY-MM-DD`) | Date the latest filing was submitted |
+  | `issuer_name` | string | **📌 Name** — underlying issuer name (e.g. `TESLA MOTORS`) |
+  | `cusip` | string | CUSIP of the underlying security |
+  | `ticker` | string \| null | **📌 Ticker** — resolved from CUSIP; `null` if unmapped |
+  | `is_common_stock` | boolean | Always `false` for the options feed |
+  | `put_or_call` | string \| null | **📌 Contract type** — `Put` / `Call` (or `PUT` / `CALL`) |
+  | `change_type` | string | `new`, `closed`, `increased`, or `decreased` |
+  | `current_shares` | integer \| null | **📌 Shares** — contracts held in the latest filing |
+  | `previous_shares` | integer \| null | Contracts held in the previous filing |
+  | `change_in_share` | integer \| null | `current_shares - previous_shares` |
+  | `percent_change` | float \| null | Percentage share change vs. previous filing (2 decimals) |
+  | `current_value` | integer \| null | **📌 Value** — current position value in thousands of $ |
+  | `previous_value` | integer \| null | Previous position value in thousands of $ |
+  | `absolute_value_change` | integer | `abs(current_value - previous_value)` in thousands of $ |
+  | `current_price_per_share` | float \| null | `current_value / current_shares` (2 decimals) |
+  | `previous_price_per_share` | float \| null | `previous_value / previous_shares` (2 decimals) |
+
+> ⚠️ **Units**: All `*_value` fields (and the `min_value` filter) use the SEC 13F convention of **thousands of dollars** — e.g. `current_value: 2500000` = **$2.5 billion**, not $2.5M.
+
 * **Example**:
   ```bash
   curl "http://localhost:8000/activity/latest/options?ticker=TSLA&put_or_call=CALL&change_type=new"
+  ```
+* **Example response** (fields abridged for brevity):
+  ```json
+  {
+    "activities": [
+      {
+        "cik": "0001318605",
+        "company_name": "Tesla Inc",
+        "aum": 123456789,
+        "latest_accession_number": "0001067983-25-000123",
+        "previous_accession_number": "0001067983-25-000098",
+        "reporting_period": "2025-06-30",
+        "filing_date": "2025-08-14",
+        "issuer_name": "TESLA MOTORS",
+        "cusip": "88160R101",
+        "ticker": "TSLA",
+        "is_common_stock": false,
+        "put_or_call": "CALL",
+        "change_type": "new",
+        "current_shares": 10000,
+        "previous_shares": null,
+        "change_in_share": 10000,
+        "percent_change": null,
+        "current_value": 2500000,
+        "previous_value": null,
+        "absolute_value_change": 2500000,
+        "current_price_per_share": 250.0,
+        "previous_price_per_share": null
+      }
+    ],
+    "has_next_page": false
+  }
   ```
 
 #### `GET /activity/latest/v3` — Common Stock Activity Stream
