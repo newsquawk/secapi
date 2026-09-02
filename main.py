@@ -3323,25 +3323,18 @@ def get_daily_stock_flow(
     WITH TargetIssuer AS (
         SELECT issuer_id FROM issuers WHERE cusip = %s LIMIT 1
     ),
-    CompaniesWithStock AS (
-        -- 1. Find ONLY the companies that have EVER held this specific stock
-        SELECT DISTINCT f.company_id
-        FROM holdings h
-        JOIN filings f ON h.filing_id = f.filing_id
-        WHERE h.issuer_id = (SELECT issuer_id FROM TargetIssuer)
-    ),
-    RelevantFilings AS (
-        -- 2. Only look at filings in our date window FOR THOSE SPECIFIC COMPANIES
+    RecentFilings AS (
+        -- 1. Find all recent filings in our date window
         SELECT f.filing_id, f.company_id, f.filing_date, f.period_of_report
         FROM filings f
-        JOIN CompaniesWithStock cws ON f.company_id = cws.company_id
         WHERE f.filing_date >= %s
           AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
     ),
     PreviousFilings AS (
-        -- 3. Now we only run this subquery a few dozen times instead of thousands
+        -- 2. Find the previous filing for each recent filing
         SELECT
             rf.filing_id AS current_filing_id,
+            rf.filing_date,
             (
                 SELECT f2.filing_id
                 FROM filings f2
@@ -3351,28 +3344,23 @@ def get_daily_stock_flow(
                 ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
                 LIMIT 1
             ) AS previous_filing_id
-        FROM RelevantFilings rf
-    ),
-    StockHoldings AS (
-        -- 4. Pre-fetch the exact share counts for this specific stock
-        SELECT filing_id, shares_or_principal_amount
-        FROM holdings
-        WHERE issuer_id = (SELECT issuer_id FROM TargetIssuer)
+        FROM RecentFilings rf
     ),
     HoldingsComparison AS (
-        -- 5. Join it all together instantly
+        -- 3. Join with holdings for the target issuer only
         SELECT
-            rf.filing_date,
+            pf.filing_date,
             COALESCE(h_curr.shares_or_principal_amount, 0) as current_shares,
             COALESCE(h_prev.shares_or_principal_amount, 0) as previous_shares
-        FROM RelevantFilings rf
-        JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
-        LEFT JOIN StockHoldings h_curr ON rf.filing_id = h_curr.filing_id
-        LEFT JOIN StockHoldings h_prev ON pf.previous_filing_id = h_prev.filing_id
+        FROM PreviousFilings pf
+        LEFT JOIN holdings h_curr ON h_curr.filing_id = pf.current_filing_id 
+                                 AND h_curr.issuer_id = (SELECT issuer_id FROM TargetIssuer)
+        LEFT JOIN holdings h_prev ON h_prev.filing_id = pf.previous_filing_id 
+                                 AND h_prev.issuer_id = (SELECT issuer_id FROM TargetIssuer)
         WHERE h_curr.shares_or_principal_amount IS NOT NULL
            OR h_prev.shares_or_principal_amount IS NOT NULL
     )
-    -- 6. Group by Filing Date
+    -- 4. Group by Filing Date
     SELECT
         filing_date,
         SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END) as gross_buying,
@@ -3468,22 +3456,16 @@ def get_aggregate_stock_flow(
     WITH TargetIssuer AS (
         SELECT issuer_id FROM issuers WHERE cusip = %s LIMIT 1
     ),
-    CompaniesWithStock AS (
-        SELECT DISTINCT f.company_id
-        FROM holdings h
-        JOIN filings f ON h.filing_id = f.filing_id
-        WHERE h.issuer_id = (SELECT issuer_id FROM TargetIssuer)
-    ),
-    RelevantFilings AS (
+    RecentFilings AS (
         SELECT f.filing_id, f.company_id, f.filing_date, f.period_of_report
         FROM filings f
-        JOIN CompaniesWithStock cws ON f.company_id = cws.company_id
         WHERE f.filing_date >= %s
           AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
     ),
     PreviousFilings AS (
         SELECT
             rf.filing_id AS current_filing_id,
+            rf.filing_date,
             (
                 SELECT f2.filing_id
                 FROM filings f2
@@ -3493,26 +3475,22 @@ def get_aggregate_stock_flow(
                 ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
                 LIMIT 1
             ) AS previous_filing_id
-        FROM RelevantFilings rf
-    ),
-    StockHoldings AS (
-        SELECT filing_id, shares_or_principal_amount
-        FROM holdings
-        WHERE issuer_id = (SELECT issuer_id FROM TargetIssuer)
+        FROM RecentFilings rf
     ),
     HoldingsComparison AS (
         SELECT
-            rf.filing_date,
+            pf.filing_date,
             COALESCE(h_curr.shares_or_principal_amount, 0) as current_shares,
             COALESCE(h_prev.shares_or_principal_amount, 0) as previous_shares
-        FROM RelevantFilings rf
-        JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
-        LEFT JOIN StockHoldings h_curr ON rf.filing_id = h_curr.filing_id
-        LEFT JOIN StockHoldings h_prev ON pf.previous_filing_id = h_prev.filing_id
+        FROM PreviousFilings pf
+        LEFT JOIN holdings h_curr ON h_curr.filing_id = pf.current_filing_id 
+                                 AND h_curr.issuer_id = (SELECT issuer_id FROM TargetIssuer)
+        LEFT JOIN holdings h_prev ON h_prev.filing_id = pf.previous_filing_id 
+                                 AND h_prev.issuer_id = (SELECT issuer_id FROM TargetIssuer)
         WHERE h_curr.shares_or_principal_amount IS NOT NULL
            OR h_prev.shares_or_principal_amount IS NOT NULL
     )
-    -- 6. Aggregate everything together
+    -- 4. Aggregate everything together
     SELECT
         COALESCE(SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END), 0) as total_gross_buying,
         COALESCE(SUM(CASE WHEN current_shares < previous_shares THEN ABS(current_shares - previous_shares) ELSE 0 END), 0) as total_gross_selling,
