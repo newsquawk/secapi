@@ -253,7 +253,8 @@ async def lifespan(app: FastAPI):
 
 
 # Initialize FastAPI app and rate limiter
-limiter = Limiter(key_func=get_remote_address, default_limits=["20/minute"])
+RATE_LIMIT = os.getenv("RATE_LIMIT", "120/minute")
+limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
 
 app = FastAPI(
     title="SEC API",
@@ -2040,19 +2041,32 @@ class LatestStoriesResponse(BaseModel):
 
 
 FILING_QUERY_V2 = """
-WITH RankedFilings AS (
+WITH CandidateFilings AS (
     SELECT
         f.filing_id,
         f.company_id,
         f.accession_number,
         f.period_of_report,
         f.filing_date,
-        f.created_at,
-        ROW_NUMBER() OVER(PARTITION BY f.company_id ORDER BY f.filing_date DESC, f.created_at DESC) as rn
+        f.created_at
     FROM
         filings f
     WHERE
         f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+    ORDER BY f.filing_date DESC, f.created_at DESC
+    LIMIT 2000
+),
+RankedFilings AS (
+    SELECT
+        filing_id,
+        company_id,
+        accession_number,
+        period_of_report,
+        filing_date,
+        created_at,
+        ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
+    FROM
+        CandidateFilings
 ),
 LatestFilings AS (
     SELECT
@@ -2695,7 +2709,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
 def get_latest_activity_v3(
     request: Request,
     limit: int = Query(
-        3, description="Number of *companies* to fetch stories for", ge=1, le=50
+        3, description="Number of *companies* to fetch stories for", ge=1, le=15
     ),
     offset: int = Query(
         0, description="Number of *companies* to skip for pagination", ge=0
@@ -2784,9 +2798,9 @@ def get_latest_activity_v3(
         db.execute(final_query_template, final_query_params)
         results = db.fetchall()
 
-        # Serialize into our new HoldingActivity model and inject the ticker
+        # Serialize into our new HoldingActivity model and inject the ticker (capped to 1000 to prevent OOM)
         activities = []
-        for row in results:
+        for row in results[:1000]:
             activity_dict = dict(row)
             # Try to find the ticker based on the CUSIP
             activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
@@ -3284,13 +3298,13 @@ def get_free_float(ticker: str) -> float | None:
             )
             return float_in_millions
         else:
-            logger.warning(f"Yahoo Finance has no float data for {ticker}.")
-            # Cache a None or 0 to prevent repeated failed API calls?
-            # For now, we just return None.
+            logger.warning(f"Yahoo Finance has no float data for {ticker}. Caching None.")
+            FREE_FLOAT_DATA[ticker] = None
             return None
 
     except Exception as e:
-        logger.error(f"Error fetching float for {ticker} via yfinance: {e}")
+        logger.error(f"Error fetching float for {ticker} via yfinance: {e}. Caching None.")
+        FREE_FLOAT_DATA[ticker] = None
         return None
 
 
@@ -3324,14 +3338,12 @@ def get_daily_stock_flow(
         SELECT issuer_id FROM issuers WHERE cusip = %s LIMIT 1
     ),
     RecentFilings AS (
-        -- 1. Find all recent filings in our date window
         SELECT f.filing_id, f.company_id, f.filing_date, f.period_of_report
         FROM filings f
         WHERE f.filing_date >= %s
           AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
     ),
     PreviousFilings AS (
-        -- 2. Find the previous filing for each recent filing
         SELECT
             rf.filing_id AS current_filing_id,
             rf.filing_date,
@@ -3347,7 +3359,6 @@ def get_daily_stock_flow(
         FROM RecentFilings rf
     ),
     HoldingsComparison AS (
-        -- 3. Join with holdings for the target issuer only
         SELECT
             pf.filing_date,
             COALESCE(h_curr.shares_or_principal_amount, 0) as current_shares,
@@ -3360,7 +3371,6 @@ def get_daily_stock_flow(
         WHERE h_curr.shares_or_principal_amount IS NOT NULL
            OR h_prev.shares_or_principal_amount IS NOT NULL
     )
-    -- 4. Group by Filing Date
     SELECT
         filing_date,
         SUM(CASE WHEN current_shares > previous_shares THEN (current_shares - previous_shares) ELSE 0 END) as gross_buying,
