@@ -19,6 +19,8 @@ import logging
 import sys
 import math
 import json
+import hashlib
+import concurrent.futures
 import yfinance as yf
 
 # rate-limiting
@@ -52,6 +54,8 @@ TICKER_TO_CUSIP = {}
 CUSIP_TO_TICKER = {}
 COMPARE_CACHE_MAX_SIZE = 100
 COMPARE_CACHE: OrderedDict[str, dict] = OrderedDict()
+AI_SUMMARY_CACHE_MAX_SIZE = 200
+AI_SUMMARY_CACHE: OrderedDict[str, str] = OrderedDict()
 
 RUSSELL_FILE_PATH = "data/russell_share_data.csv"
 CUSIP_DETAILS_FILE_PATH = "data/cusip_details_filtered_fixed.csv"
@@ -71,7 +75,7 @@ logging.basicConfig(
 logger = logging.getLogger("secapi")
 
 if DEEPSEEK_API_KEY:
-    client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+    client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com", timeout=10.0)
 
 DEFINED_SCHEMA = {
     "cik": pl.String,
@@ -1126,12 +1130,30 @@ async def openai_call(
         [f"{k} {v}" for k, v in decreased_holdings_dict.items()]
     )
 
+    combined_input = f"{new_holding_text}#{closed_positions_text}#{increased_holdings_text}#{decreased_holdings_text}"
+    if not combined_input.replace("#", "").strip():
+        return JSONResponse(
+            content={"summary": "No significant position changes detected for this filing."},
+            headers={"Cache-Control": "public, max-age=86400, immutable"},
+        )
+
+    # Check in-memory LRU cache
+    cache_key = hashlib.sha256(combined_input.encode("utf-8")).hexdigest()
+    if cache_key in AI_SUMMARY_CACHE:
+        logger.info(f"Serving AI summary for {cache_key[:8]} from in-memory cache")
+        AI_SUMMARY_CACHE.move_to_end(cache_key)
+        return JSONResponse(
+            content={"summary": AI_SUMMARY_CACHE[cache_key]},
+            headers={"Cache-Control": "public, max-age=86400, immutable"},
+        )
+
     async def _get_summary(title, data_text):
+        if not data_text.strip():
+            return ""
         prompt = f"""
         Generate a summary of the holdings changes for the fund management in one or two sentences.
         {title}: {data_text}
         """
-        # Assuming an async OpenAI client
         response = await client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=[
@@ -1142,6 +1164,7 @@ async def openai_call(
                 {"role": "user", "content": prompt},
             ],
             stream=False,
+            timeout=10.0,
         )
         return response.choices[0].message.content
 
@@ -1154,8 +1177,19 @@ async def openai_call(
     try:
         texts = await asyncio.gather(*api_calls)
 
-        final_summary = " ".join([text for text in texts if text])
-        return JSONResponse(content={"summary": final_summary})
+        final_summary = " ".join([text for text in texts if text]).strip()
+        if not final_summary:
+            final_summary = "No significant position changes detected."
+
+        # Cache in memory
+        AI_SUMMARY_CACHE[cache_key] = final_summary
+        if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
+            AI_SUMMARY_CACHE.popitem(last=False)
+
+        return JSONResponse(
+            content={"summary": final_summary},
+            headers={"Cache-Control": "public, max-age=86400, immutable"},
+        )
     except Exception as e:
         logger.error(f"Error calling OpenAI API: {e}", exc_info=True)
         return JSONResponse(
@@ -3299,8 +3333,10 @@ def get_free_float(ticker: str) -> float | None:
         logger.info(f"Ticker {ticker} not in CSV. Fetching float from Yahoo Finance...")
         stock = yf.Ticker(ticker)
 
-        # Yahoo Finance returns float shares as a raw number (e.g., 50000000)
-        float_shares_raw = stock.info.get("floatShares")
+        # Enforce 5-second timeout to prevent worker thread starvation
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: stock.info.get("floatShares"))
+            float_shares_raw = future.result(timeout=5.0)
 
         if float_shares_raw:
             # Convert to millions to match your CSV format
