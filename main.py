@@ -1,17 +1,17 @@
 import psycopg2
-from fastapi import FastAPI, Depends, HTTPException, Query, Body, Request, Header
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, Request, Header, Response, status
 import os
 import uvicorn
 import polars as pl
 import asyncio
 from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
-from fastapi import HTTPException
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool, PoolError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from typing import List, Dict, Optional
+from collections import OrderedDict
 from pydantic import BaseModel
 import datetime as dt
 import pandas as pd
@@ -50,6 +50,8 @@ CUSIP_TO_CIK = {}
 CIK_TO_TICKER = {}
 TICKER_TO_CUSIP = {}
 CUSIP_TO_TICKER = {}
+COMPARE_CACHE_MAX_SIZE = 100
+COMPARE_CACHE: OrderedDict[str, dict] = OrderedDict()
 
 RUSSELL_FILE_PATH = "data/russell_share_data.csv"
 CUSIP_DETAILS_FILE_PATH = "data/cusip_details_filtered_fixed.csv"
@@ -1193,46 +1195,32 @@ FILING_QUERY_WITH_PRIORITY = """
 
 HOLDINGS_QUERY = """
     SELECT
-        h.holding_id,
         i.issuer_name,
-        t.name AS title_of_class,
         COALESCE(t.is_common_stock, FALSE) AS is_common_stock,
         h.shares_or_principal_amount,
-        s.name AS shares_or_principal_type,
         h.value,
         p.name AS put_or_call,
-        d.name AS investment_discretion,
-        h.voting_authority_sole,
-        h.voting_authority_shared,
-        h.voting_authority_none,
         i.cusip,
         i.sic
     FROM holdings h
     LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
     LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
-    LEFT JOIN share_type_table s ON h.shares_or_principal_type = s.id
     LEFT JOIN put_or_call_table p ON h.put_or_call = p.id
-    LEFT JOIN investment_discretion_table d ON h.investment_discretion = d.id
     WHERE h.filing_id = (SELECT filing_id FROM filings WHERE accession_number = %s)
     ORDER BY h.value DESC
+    LIMIT 25000
 """
 
 HOLDINGS_SCHEMA = {
-    "holding_id": pl.Int64,
     "issuer_name": pl.Utf8,
-    "title_of_class": pl.Utf8,
     "is_common_stock": pl.Boolean,
     "shares_or_principal_amount": pl.Int64,
-    "shares_or_principal_type": pl.Utf8,
     "value": pl.Int64,
     "put_or_call": pl.Utf8,
-    "investment_discretion": pl.Utf8,
-    "voting_authority_sole": pl.Int64,
-    "voting_authority_shared": pl.Int64,
-    "voting_authority_none": pl.Int64,
     "cusip": pl.Utf8,
     "sic": pl.Int64,
 }
+
 
 
 def _process_filings(
@@ -1307,6 +1295,7 @@ def compare_holdings(
     request: Request,
     previous_accession: str,
     latest_accession: str,
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -1317,6 +1306,16 @@ def compare_holdings(
 
         acc_latest = latest_accession.strip()
         acc_prev = previous_accession.strip()
+
+        # Check in-memory LRU cache (instant 0.1ms return)
+        cache_key = f"{acc_prev}_{acc_latest}"
+        if cache_key in COMPARE_CACHE:
+            logger.info(f"Serving comparison for {cache_key} from in-memory cache")
+            COMPARE_CACHE.move_to_end(cache_key)
+            if response:
+                response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800, immutable"
+                response.headers["ETag"] = f'"{hash(cache_key)}"'
+            return COMPARE_CACHE[cache_key]
 
         # Get filing details for the previous and latest filings
         db.execute(FILING_QUERY_WITH_PRIORITY, (acc_prev, acc_prev))
@@ -1847,6 +1846,15 @@ def compare_holdings(
             },
         }
 
+        # Store in in-memory LRU cache and set caching headers
+        COMPARE_CACHE[cache_key] = response_data
+        if len(COMPARE_CACHE) > COMPARE_CACHE_MAX_SIZE:
+            COMPARE_CACHE.popitem(last=False)  # Evict oldest entry
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800, immutable"
+            response.headers["ETag"] = f'"{hash(cache_key)}"'
+
         return response_data
 
     except HTTPException as e:
@@ -1926,6 +1934,7 @@ def api_save_comparison(accession_1: str, accession_2: str, db):
 def compare_latest_filings(
     request: Request,
     cik: str,
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -1967,11 +1976,11 @@ def compare_latest_filings(
         )
 
         # Step 2: Use the existing compare_holdings logic to perform the comparison
-        # You'll need to call the function directly here
         return compare_holdings(
             request=request,
             previous_accession=previous_filing,
             latest_accession=latest_filing,
+            response=response,
             db=db,
         )
 
