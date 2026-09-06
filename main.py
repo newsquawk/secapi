@@ -371,15 +371,20 @@ def get_db_cursor():
                 pass
         if conn:
             if is_pooled and db_pool is not None:
-                if not conn.closed:
+                if conn.closed:
+                    try:
+                        db_pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+                else:
                     try:
                         conn.rollback()
                     except Exception:
                         pass
-                try:
-                    db_pool.putconn(conn)
-                except Exception:
-                    logger.error("Failed to return connection to pool", exc_info=True)
+                    try:
+                        db_pool.putconn(conn)
+                    except Exception:
+                        logger.error("Failed to return connection to pool", exc_info=True)
             else:
                 try:
                     conn.close()
@@ -748,7 +753,8 @@ def get_filings(
             db.execute(filings_query, (limit, offset))
             filings_data = db.fetchall()
         else:
-            count_query = "SELECT COUNT(*) FROM filings"
+            # Finding P12: Use pg_class reltuples for O(1) count instead of full 288k table scan
+            count_query = "SELECT COALESCE(NULLIF(reltuples::bigint, 0), (SELECT count(*) FROM filings)) AS count FROM pg_class WHERE relname = 'filings'"
             db.execute(count_query)
             total_count = db.fetchone()["count"]  # type: ignore
 
