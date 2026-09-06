@@ -14,6 +14,7 @@ from typing import List, Dict, Optional
 from collections import OrderedDict
 from pydantic import BaseModel
 import datetime as dt
+import time
 import pandas as pd
 import logging
 import sys
@@ -308,6 +309,42 @@ async def add_security_headers(request: Request, call_next):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-XSS-Protection", "0")
     return response
+
+
+# Request timing and structured access logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Skip healthcheck polling to keep logs clean
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    start_time = time.perf_counter()
+    raw_forwarded = request.headers.get("x-forwarded-for")
+    client_ip = (
+        raw_forwarded.split(",")[0].strip()
+        if raw_forwarded
+        else (request.client.host if request.client else "unknown")
+    )
+    url_path = (
+        f"{request.url.path}?{request.url.query}"
+        if request.url.query
+        else request.url.path
+    )
+
+    try:
+        response = await call_next(request)
+        process_time = (time.perf_counter() - start_time) * 1000
+        response.headers["X-Process-Time"] = f"{process_time:.2f}ms"
+        logger.info(
+            f"{request.method} {url_path} -> {response.status_code} ({process_time:.2f}ms) [{client_ip}]"
+        )
+        return response
+    except Exception as exc:
+        process_time = (time.perf_counter() - start_time) * 1000
+        logger.error(
+            f"{request.method} {url_path} -> FAILED: {exc} ({process_time:.2f}ms) [{client_ip}]"
+        )
+        raise
 
 
 def get_db_connection():
