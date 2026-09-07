@@ -78,6 +78,8 @@ jobs:
               --restart always \
               --network=network-a \
               -p 8000:8000 \
+              --memory="1g" \
+              --memory-swap="1.5g" \
               --log-opt max-size=10m \
               --log-opt max-file=3 \
               -e DB_HOST=sec-database \
