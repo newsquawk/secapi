@@ -481,7 +481,8 @@ def _format_address(
     return full_address
 
 
-@app.get("/managers/", response_model=list[dict])
+@app.get("/managers", response_model=list[dict])
+@app.get("/managers/", response_model=list[dict], include_in_schema=False)
 def get_managers(
     request: Request,
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
@@ -716,7 +717,8 @@ def get_manager_filings(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/filings/", response_model=dict)
+@app.get("/filings", response_model=dict)
+@app.get("/filings/", response_model=dict, include_in_schema=False)
 def get_filings(
     request: Request,
     limit: int = Query(100, description="Number of items to return", ge=1, le=100),
