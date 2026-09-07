@@ -249,11 +249,37 @@ def close_db_pool() -> None:
             db_pool = None
 
 
+def init_ai_summary_table() -> None:
+    """Ensure the ai_summaries persistent cache table exists."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_summaries (
+                    cache_key VARCHAR(64) PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+        logger.info("Initialized/verified ai_summaries persistent cache table.")
+    except Exception as e:
+        logger.warning(f"Could not auto-create ai_summaries table: {e}")
+    finally:
+        if conn and not conn.closed:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_production_config()
     logger.info("secapi starting")
     init_db_pool()
+    init_ai_summary_table()
     yield
     logger.info("secapi shutting down")
     close_db_pool()
@@ -1115,11 +1141,25 @@ def get_holding_by_accession_number(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
+def _format_holdings_text(d: dict) -> str:
+    """Format dictionary entries deterministically with sorted keys."""
+    items = []
+    for k in sorted(d.keys()):
+        val = d[k]
+        if isinstance(val, dict):
+            inner_str = ", ".join(f"{ik}: {val[ik]}" for ik in sorted(val.keys()))
+            items.append(f"{k} {{{inner_str}}}")
+        else:
+            items.append(f"{k} {val}")
+    return "|".join(items)
+
+
 @app.post("/api/ai_summary")
-@limiter.limit("20/minute")
+@limiter.limit(RATE_LIMIT)
 async def openai_call(
     request: Request,
     payload: HoldingsRequest = Body(...),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
 
     if not DEEPSEEK_API_KEY:
@@ -1190,16 +1230,10 @@ async def openai_call(
         for row in decreased_holdings_top_5.to_dicts()
     }
 
-    new_holding_text = "|".join([f"{k} {v}" for k, v in new_holdings_dict.items()])
-    closed_positions_text = "|".join(
-        [f"{k} {v}" for k, v in closed_positions_dict.items()]
-    )
-    increased_holdings_text = "|".join(
-        [f"{k} {v}" for k, v in increased_holdings_dict.items()]
-    )
-    decreased_holdings_text = "|".join(
-        [f"{k} {v}" for k, v in decreased_holdings_dict.items()]
-    )
+    new_holding_text = _format_holdings_text(new_holdings_dict)
+    closed_positions_text = _format_holdings_text(closed_positions_dict)
+    increased_holdings_text = _format_holdings_text(increased_holdings_dict)
+    decreased_holdings_text = _format_holdings_text(decreased_holdings_dict)
 
     combined_input = f"{new_holding_text}#{closed_positions_text}#{increased_holdings_text}#{decreased_holdings_text}"
     if not combined_input.replace("#", "").strip():
@@ -1208,8 +1242,10 @@ async def openai_call(
             headers={"Cache-Control": "public, max-age=86400, immutable"},
         )
 
-    # Check in-memory LRU cache
+    # Deterministic SHA256 cache key
     cache_key = hashlib.sha256(combined_input.encode("utf-8")).hexdigest()
+
+    # Tier 1: Check in-memory LRU cache (<0.1ms)
     if cache_key in AI_SUMMARY_CACHE:
         logger.info(f"Serving AI summary for {cache_key[:8]} from in-memory cache")
         AI_SUMMARY_CACHE.move_to_end(cache_key)
@@ -1218,6 +1254,26 @@ async def openai_call(
             headers={"Cache-Control": "public, max-age=86400, immutable"},
         )
 
+    # Tier 2: Check persistent PostgreSQL cache (shared across all workers & container restarts)
+    if db:
+        try:
+            db.execute(
+                "SELECT summary FROM ai_summaries WHERE cache_key = %s;",
+                (cache_key,),
+            )
+            cached_row = db.fetchone()
+            if cached_row and cached_row.get("summary"):
+                summary_text = cached_row["summary"]
+                logger.info(f"Serving AI summary for {cache_key[:8]} from database cache")
+                AI_SUMMARY_CACHE[cache_key] = summary_text
+                return JSONResponse(
+                    content={"summary": summary_text},
+                    headers={"Cache-Control": "public, max-age=86400, immutable"},
+                )
+        except Exception as e:
+            logger.warning(f"Error checking ai_summaries table: {e}")
+
+    # Tier 3: Call DeepSeek
     async def _get_summary(title, data_text):
         if not data_text.strip():
             return ""
@@ -1252,7 +1308,24 @@ async def openai_call(
         if not final_summary:
             final_summary = "No significant position changes detected."
 
-        # Cache in memory
+        # Save to database (Tier 2)
+        if db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO ai_summaries (cache_key, summary)
+                    VALUES (%s, %s)
+                    ON CONFLICT (cache_key) DO NOTHING;
+                    """,
+                    (cache_key, final_summary),
+                )
+                if db.connection and not db.connection.closed:
+                    db.connection.commit()
+                logger.info(f"Persisted AI summary for {cache_key[:8]} to database")
+            except Exception as e:
+                logger.warning(f"Error persisting AI summary to database: {e}")
+
+        # Save to memory (Tier 1)
         AI_SUMMARY_CACHE[cache_key] = final_summary
         if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
             AI_SUMMARY_CACHE.popitem(last=False)
