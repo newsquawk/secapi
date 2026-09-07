@@ -115,7 +115,7 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
 #### `GET /activity/latest/v3` — Common Stock Activity Stream
 Retrieves a flat list of individual Common Stock position changes across the latest batch of filings.
 * **Query Parameters**:
-  * `limit` *(int, default=3, 1-50)*: Number of company filings to fetch.
+  * `limit` *(int, default=3, 1-15)*: Number of company filings to fetch.
   * `offset` *(int, default=0)*: Number of company filings to skip.
 * **Example**:
   ```bash
@@ -240,11 +240,12 @@ Convenience endpoint that automatically resolves and compares the two most recen
 ### 6. AI Summaries & Health Check
 
 #### `POST /api/ai_summary` — AI Portfolio Summary
-Accepts portfolio changes payload and generates an executive summary using DeepSeek LLM.
+Accepts portfolio changes payload and generates an executive financial summary using DeepSeek LLM.
 * **Request Body**: `{"new_holdings": [...], "closed_positions": [...], "increased_holdings": [...], "decreased_holdings": [...]}`.
+* **Persistent Two-Tier Caching**: Results are deterministically hashed and stored in PostgreSQL (`ai_summaries`) and an in-memory LRU cache. Repeated requests return in **<10ms** across all server workers without re-calling the LLM.
 
 #### `GET /health` — Liveness Probe
-Returns `{"status": "ok", "environment": "production"}`. Used by load balancers and container health checks.
+Returns `{"status": "ok"}`. Used by load balancers and container health checks.
 
 ---
 
@@ -297,6 +298,7 @@ Create a `.env` file or export the following environment variables:
 | `DB_POOL_MIN_CONN` | `4` | Minimum database pool connections |
 | `DB_POOL_MAX_CONN` | `20` | Maximum database pool connections |
 | `DEEPSEEK_API_KEY` | `null` | API key for AI summary endpoint |
+| `RATE_LIMIT` | `120/minute` | Default per-client rate limit |
 | `CORS_ORIGINS` | `""` | Comma-separated allowed frontend origins |
 
 ---
