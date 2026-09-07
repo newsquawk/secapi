@@ -485,6 +485,7 @@ def _format_address(
 @app.get("/managers/", response_model=list[dict], include_in_schema=False)
 def get_managers(
     request: Request,
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -550,6 +551,10 @@ def get_managers(
         )
 
     logger.info(f"Fetched {len(companies)} managers from the database.")
+    if response:
+        response.headers["Cache-Control"] = (
+            "public, max-age=300, stale-while-revalidate=600"
+        )
     return companies
 
 
@@ -557,6 +562,7 @@ def get_managers(
 def get_manager(
     request: Request,
     cik: str,
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -620,6 +626,10 @@ def get_manager(
             "business_address": business_address,
         }
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=3600, stale-while-revalidate=7200"
+            )
         return manager_data
     except Exception as e:
         logger.error(f"Error fetching manager with CIK {cik}: {str(e)}", exc_info=True)
@@ -632,6 +642,7 @@ def get_manager_filings(
     cik: str,
     limit: int = Query(100, ge=1, le=1000, description="Number of results to return"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -694,6 +705,11 @@ def get_manager_filings(
 
         has_more = (offset + len(filings)) < total_count
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=60, stale-while-revalidate=120"
+            )
+
         return {
             "filings": filings,
             "pagination": {
@@ -725,6 +741,7 @@ def get_filings(
     offset: int = Query(0, description="Number of items to skip", ge=0),
     sort_by: str = Query("filing_date", description="Column to sort by"),
     sort_order: str = Query("desc", description="Sort order: 'asc' or 'desc'"),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     allowed_sort_columns = {
@@ -842,6 +859,11 @@ def get_filings(
 
         has_more = (offset + len(filings)) < total_count
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=30, stale-while-revalidate=60"
+            )
+
         return {
             "filings": filings,
             "pagination": {
@@ -865,6 +887,7 @@ def get_filings(
 def get_filing_by_accession(
     request: Request,
     accession_number: str,
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
 
@@ -899,6 +922,10 @@ def get_filing_by_accession(
                 detail=f"Filing with accession number {accession_number} not found",
             )
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=86400, stale-while-revalidate=604800, immutable"
+            )
         return result  # type: ignore
 
     except Exception as e:
@@ -915,13 +942,14 @@ def get_holding_by_accession_number(
     accession_number: str,
     # limit: int = Query(100, ge=1, le=1000),
     # offset: int = Query(0, ge=0),
-    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
     draw: int = Query(0, ge=0, alias="draw"),
     start: int = Query(0, ge=0, alias="start"),
     length: int = Query(10, ge=-1, le=1000, alias="length"),
     search_value: Optional[str] = Query(None, alias="search[value]"),
     order_column_index: int = Query(0, alias="order[0][column]"),
     order_dir: str = Query("asc", alias="order[0][dir]"),
+    response: Response = Response(),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
     Retrieve a single holding by accession number
@@ -1062,6 +1090,10 @@ def get_holding_by_accession_number(
         ]
 
         # Format the response for DataTables
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=86400, stale-while-revalidate=604800, immutable"
+            )
         return {
             "draw": draw,
             "recordsTotal": total_records,
@@ -2055,13 +2087,18 @@ def compare_latest_filings(
         )
 
         # Step 2: Use the existing compare_holdings logic to perform the comparison
-        return compare_holdings(
+        result = compare_holdings(
             request=request,
             previous_accession=previous_filing,
             latest_accession=latest_filing,
             response=response,
             db=db,
         )
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=300, stale-while-revalidate=600"
+            )
+        return result
 
     except HTTPException:
         raise  # Re-raise HTTPException to be handled by FastAPI
@@ -2401,13 +2438,15 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
 
 
 @app.get("/stories/latest/v2", response_model=LatestStoriesResponse)
-@limiter.limit("20/minute")
+@app.get("/stories/latest/v2/", response_model=LatestStoriesResponse, include_in_schema=False)
+@limiter.limit(RATE_LIMIT)
 def get_latest_stories_v2(
     request: Request,
     limit: int = Query(20, description="Number of stories to return", ge=1, le=50),
     offset: int = Query(
         0, description="Number of stories to skip for pagination", ge=0
     ),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -2647,6 +2686,10 @@ def get_latest_stories_v2(
                 )
             )
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=60, stale-while-revalidate=120"
+            )
         return LatestStoriesResponse(
             stories=story_summaries, has_next_page=has_next_page
         )
@@ -2794,6 +2837,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
 
 
 @app.get("/activity/latest/v3", response_model=LatestActivityResponse)
+@app.get("/activity/latest/v3/", response_model=LatestActivityResponse, include_in_schema=False)
 def get_latest_activity_v3(
     request: Request,
     limit: int = Query(
@@ -2802,6 +2846,7 @@ def get_latest_activity_v3(
     offset: int = Query(
         0, description="Number of *companies* to skip for pagination", ge=0
     ),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -2894,6 +2939,10 @@ def get_latest_activity_v3(
             activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
             activities.append(HoldingActivity(**activity_dict))
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=60, stale-while-revalidate=120"
+            )
         return LatestActivityResponse(
             activities=activities, has_next_page=has_next_page
         )
@@ -3028,6 +3077,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
 
 
 @app.get("/activity/latest/options", response_model=LatestActivityResponse)
+@app.get("/activity/latest/options/", response_model=LatestActivityResponse, include_in_schema=False)
 def get_latest_options_activity(
     request: Request,
     limit: int = Query(
@@ -3051,6 +3101,7 @@ def get_latest_options_activity(
         description="Filter by minimum absolute dollar value change",
         ge=0,
     ),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -3203,6 +3254,10 @@ def get_latest_options_activity(
             activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
             activities.append(HoldingActivity(**activity_dict))
 
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=60, stale-while-revalidate=120"
+            )
         return LatestActivityResponse(
             activities=activities, has_next_page=has_next_page
         )
@@ -3222,6 +3277,7 @@ def search_companies(
     q: str = Query(
         ..., min_length=2, description="Search term for company name or CIK"
     ),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """
@@ -3271,6 +3327,10 @@ def search_companies(
             {"name": row["company_name"], "cik": str(row["cik_number"])}
             for row in results
         ]
+        if response:
+            response.headers["Cache-Control"] = (
+                "public, max-age=300, stale-while-revalidate=600"
+            )
         return companies
     except Exception as e:
         logger.error(f"Error during company search: {str(e)}", exc_info=True)

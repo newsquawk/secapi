@@ -37,8 +37,9 @@ jobs:
         with:
           context: .
           push: true
-          # Use the new lowercase variable here!
-          tags: ghcr.io/${{ env.OWNER_LC }}/secapi:latest
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/secapi:latest
+            ghcr.io/${{ env.OWNER_LC }}/secapi:${{ github.sha }}
 
       - name: SSH into Droplet, Pull, and Restart Container
         uses: appleboy/ssh-action@v1.0.3
@@ -86,7 +87,7 @@ jobs:
               -e DB_PASSWORD=$DB_PASSWORD \
               -e DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY \
               -e DB_NAME=sec \
-              -e CORS_ORIGINS=http://159.203.94.47:5000 \
+              -e CORS_ORIGINS=https://app.newsquawk.com,http://159.203.94.47:5000 \
               $IMAGE_NAME
             
             # 5. Clean up old unused images
