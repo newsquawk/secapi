@@ -53,3 +53,22 @@ class TestFlowTopChanges(unittest.TestCase):
         """Verify 400 Bad Request for invalid sort_by option."""
         response = self.client.get("/api/v1/flow/top-changes?date=2026-08-26&sort_by=invalid")
         self.assertEqual(response.status_code, 400)
+
+    def test_options_activity_targeted_pagination(self):
+        """Verify GET /activity/latest/options with ticker filter returns targeted full-page activities."""
+        response = self.client.get("/activity/latest/options?limit=5&offset=0&ticker=AMZN")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        activities = data.get("activities", [])
+        self.assertGreater(len(activities), 0)
+        self.assertTrue(data.get("has_next_page"))
+
+        # Every single returned activity must be for AMZN
+        for act in activities:
+            self.assertEqual(act["ticker"], "AMZN")
+            self.assertIn(act["put_or_call"], ["PUT", "CALL"])
+            self.assertIn("form_type", act)
+            self.assertIn("weight_pct", act)
+            self.assertIn("value_pct", act)
+

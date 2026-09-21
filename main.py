@@ -3010,14 +3010,79 @@ def get_latest_activity_v3(
         )
 
 
-FILTER_CANDIDATES_QUERY_OPTIONS = """
-    SELECT DISTINCT h.filing_id
-    FROM holdings h
-    JOIN put_or_call_table p ON h.put_or_call = p.id
-    JOIN issuers i ON h.issuer_id = i.issuer_id
-    WHERE h.filing_id = ANY(%(candidate_filing_ids)s)
-      AND p.name ILIKE ANY(%(put_or_call_patterns)s)
-      {cusip_filter};
+FILING_QUERY_OPTIONS = """
+WITH CandidateFilings AS (
+    SELECT
+        f.filing_id,
+        f.company_id,
+        f.accession_number,
+        f.period_of_report,
+        f.filing_date,
+        f.created_at
+    FROM
+        filings f
+    WHERE
+        f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+    ORDER BY f.filing_date DESC, f.created_at DESC
+    LIMIT 10000
+),
+RankedFilings AS (
+    SELECT
+        filing_id,
+        company_id,
+        accession_number,
+        period_of_report,
+        filing_date,
+        created_at,
+        ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
+    FROM
+        CandidateFilings
+),
+LatestFilings AS (
+    SELECT
+        rf.filing_id,
+        rf.company_id,
+        rf.accession_number,
+        rf.period_of_report,
+        rf.filing_date,
+        rf.created_at
+    FROM RankedFilings rf
+    WHERE rf.rn = 1
+      AND EXISTS (
+          SELECT 1 FROM holdings h
+          JOIN put_or_call_table p ON h.put_or_call = p.id
+          {issuer_join}
+          WHERE h.filing_id = rf.filing_id
+            AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+            {cusip_filter}
+      )
+    ORDER BY rf.filing_date DESC, rf.created_at DESC
+    LIMIT %(limit)s OFFSET %(offset)s
+)
+SELECT
+    lf.filing_id,
+    lf.company_id,
+    lf.accession_number,
+    lf.period_of_report,
+    lf.filing_date,
+    lf.created_at,
+    c.company_name,
+    c.cik_number,
+    c.aum,
+    pf.filing_id AS previous_filing_id,
+    pf.accession_number AS previous_accession_number
+FROM LatestFilings lf
+JOIN companies c ON lf.company_id = c.company_id
+LEFT JOIN LATERAL (
+    SELECT filing_id, accession_number
+    FROM filings
+    WHERE company_id = lf.company_id
+        AND period_of_report < lf.period_of_report
+        AND form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+    ORDER BY period_of_report DESC, filing_date DESC
+    LIMIT 1
+) pf ON true
+ORDER BY lf.filing_date DESC, lf.created_at DESC;
 """
 
 LATEST_ACTIVITY_QUERY_OPTIONS = """
@@ -3032,7 +3097,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
     AggregatedHoldings AS (
         SELECT
             h.filing_id,
-            i.cusip,
+            UPPER(i.cusip) AS cusip,
             p.name AS put_or_call,
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
@@ -3043,7 +3108,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
           AND p.name ILIKE ANY(%(put_or_call_patterns)s)
           {cusip_filter}
-        GROUP BY h.filing_id, i.cusip, p.name
+        GROUP BY h.filing_id, UPPER(i.cusip), p.name
     ),
     HoldingsComparison AS (
         SELECT
@@ -3223,7 +3288,15 @@ def get_latest_options_activity(
             )
         target_cusip = resolved_cusip
 
-    cusip_filter = "AND i.cusip = %(target_cusip)s" if target_cusip else ""
+    if target_cusip:
+        issuer_join = "JOIN issuers i ON h.issuer_id = i.issuer_id"
+        candidate_cusip_filter = "AND i.cusip IN (%(target_cusip)s, LOWER(%(target_cusip)s))"
+        activity_cusip_filter = "AND i.cusip IN (%(target_cusip)s, LOWER(%(target_cusip)s))"
+    else:
+        issuer_join = ""
+        candidate_cusip_filter = ""
+        activity_cusip_filter = ""
+
     actual_min_value = min_value if isinstance(min_value, (int, float)) else None
     min_value_filter = (
         "AND ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) >= %(min_value)s"
@@ -3232,39 +3305,31 @@ def get_latest_options_activity(
     )
 
     try:
-        # Step 1: Get candidate companies (paginated)
-        db.execute(FILING_QUERY_V2, {"limit": actual_limit + 1, "offset": actual_offset})
-        candidate_filings = db.fetchall()
-
-        has_next_page = len(candidate_filings) > actual_limit
-        candidates_to_process = candidate_filings[:actual_limit]
-
-        if not candidates_to_process:
-            return LatestActivityResponse(activities=[])
-
-        # Step 2: Filter candidates to only those holding Options (Put/Call) matching criteria
-        candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
-        filter_candidates_query = FILTER_CANDIDATES_QUERY_OPTIONS.format(
-            cusip_filter=cusip_filter
+        # Step 1: Get candidate companies directly filtered by options and target ticker
+        options_filing_query = FILING_QUERY_OPTIONS.format(
+            issuer_join=issuer_join,
+            cusip_filter=candidate_cusip_filter,
         )
-        params = {
-            "candidate_filing_ids": candidate_filing_ids,
+        query_params = {
+            "limit": actual_limit + 1,
+            "offset": actual_offset,
             "put_or_call_patterns": put_or_call_patterns,
         }
         if target_cusip:
-            params["target_cusip"] = target_cusip
+            query_params["target_cusip"] = target_cusip
 
-        db.execute(filter_candidates_query, params)
-        valid_filing_ids = {row["filing_id"] for row in db.fetchall()}
+        db.execute(options_filing_query, query_params)
+        candidate_filings = db.fetchall()
 
-        valid_filings = [
-            f for f in candidates_to_process if f["filing_id"] in valid_filing_ids
-        ]
+        has_next_page = len(candidate_filings) > actual_limit
+        valid_filings = candidate_filings[:actual_limit]
 
         if not valid_filings:
-            return LatestActivityResponse(activities=[])
+            return LatestActivityResponse(activities=[], has_next_page=False)
 
-        # Step 3: Prepare the VALUES list and parameters for the main query
+        valid_filing_ids = {f["filing_id"] for f in valid_filings}
+
+        # Step 2: Prepare the VALUES list and parameters for the main query
         filing_ids_to_process = set()
         filing_data_tuples = []
 
@@ -3301,7 +3366,7 @@ def get_latest_options_activity(
 
         # Prepare the final query
         final_query_template = LATEST_ACTIVITY_QUERY_OPTIONS.format(
-            cusip_filter=cusip_filter, min_value_filter=min_value_filter
+            cusip_filter=activity_cusip_filter, min_value_filter=min_value_filter
         ).replace("%s", values_string)
 
         final_query_params = {
@@ -3315,7 +3380,7 @@ def get_latest_options_activity(
         if actual_min_value is not None:
             final_query_params["min_value"] = actual_min_value
 
-        # Step 4: Execute the query and serialize the results
+        # Step 3: Execute the query and serialize the results
         db.execute(final_query_template, final_query_params)
         results = db.fetchall()
 
@@ -3323,7 +3388,11 @@ def get_latest_options_activity(
         activities = []
         for row in results:
             activity_dict = dict(row)
-            activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
+            clean_cusip = activity_dict["cusip"].upper() if activity_dict.get("cusip") else None
+            activity_dict["ticker"] = (
+                CUSIP_TO_TICKER.get(clean_cusip)
+                or CUSIP_TO_TICKER.get(activity_dict["cusip"])
+            )
             activities.append(HoldingActivity(**activity_dict))
 
         if response:
