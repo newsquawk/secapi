@@ -15,6 +15,7 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
   - [6. Portfolio Comparison & Analysis](#6-portfolio-comparison--analysis)
   - [7. AI Summaries & Health Check](#7-ai-summaries--health-check)
 - [🧪 Running Tests](#-running-tests)
+- [🗄️ Database Migrations & Integrity Scripts](#️-database-migrations--integrity-scripts)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
 - [⚙️ Configuration](#️-configuration)
@@ -43,7 +44,7 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
   * `ticker` *(string, optional)*: Filter by stock ticker or CUSIP (e.g. `NVDA`, `AAPL`).
   * `put_or_call` *(string, optional)*: Filter by contract type (`PUT` or `CALL`).
   * `change_type` *(string, optional)*: Filter by action (`new`, `closed`, `increased`, `decreased`).
-  * `min_value` *(float, optional)*: Filter by minimum absolute dollar value change. Compared against values expressed in **thousands of dollars** (see Units below), e.g. `10000` ≈ $10M+.
+  * `min_value` *(float, optional)*: Filter by minimum absolute dollar value change in **whole dollars ($)**, e.g. `10000000` = $10M+.
   * `limit` *(int, default=10, 1-50)*: Number of fund filings to fetch (not the number of trade rows).
   * `offset` *(int, default=0)*: Number of fund filings to skip.
 * **Response envelope**: `{ "activities": [ ... ], "has_next_page": boolean }`. `has_next_page` is `true` when more filings exist beyond the current `limit` / `offset` window.
@@ -361,6 +362,22 @@ The test suite validates data normalization accuracy against historical stock ma
    - Verifies that post-2023 sub-$1 penny stocks (e.g. $0.44/share) are preserved in whole dollars and not inflated.
 2. **Characterization Regression (`tests/test_characterization.py`)**:
    - Verifies live query outputs against baseline snapshots (`tests/snapshots/baseline_current.json`) across 4 test cohorts (Pre-2023, Penny Stocks, Post-2023 Standard, Options) to guarantee zero unwanted output drift.
+3. **Change Feed & Stream (`tests/test_sync_endpoints.py`)**:
+   - Validates `GET /changes/head`, cursor pagination draining down to `next_cursor: null`, and persistent `/stream` SSE connection frames.
+4. **Flow Top Changes & Options (`tests/test_flow_top_changes.py`)**:
+   - Validates uppercase CUSIP uniqueness, sort-by validation, and candidate pushdown filtering for options activity.
+
+---
+
+## 🗄️ Database Migrations & Integrity Scripts
+
+Located in [`scripts/`](scripts/):
+* **CUSIP Deduplication & Normalization (`scripts/deduplicate_issuers.py`)**:
+  - Batched migration runner that merges legacy duplicate lowercase/uppercase issuer rows, repoints referencing `holdings` rows using indexed lookups without table locks, and uppercases solitary CUSIPs.
+  - Enforces database constraint `chk_issuers_cusip_upper` (`cusip IS NULL OR cusip = UPPER(cusip)`) and unique index `idx_issuers_cusip_upper ON issuers (UPPER(cusip))`.
+  - Supports `--dry-run` and configurable `--batch-size`.
+* **SQL Schema Reference (`scripts/005_deduplicate_issuers.sql`)**:
+  - DDL reference for `holdings_normalised`, CUSIP uppercase constraints, and indexes.
 
 ---
 
