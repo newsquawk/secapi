@@ -148,3 +148,34 @@ class TopStockChangesResponse(BaseModel):
     date: dt.date
     sort_by: str
     stocks: List[TopStockChangeEntry]
+
+
+class FilingEnvelope(BaseModel):
+    """Filing envelope carrying metadata and holding activities for downstream ingestion."""
+
+    filing_id: int
+    accession_number: str
+    cik: str
+    company_name: str
+    form_type: str
+    filing_date: dt.date
+    period_of_report: dt.date
+    aum: Optional[int] = None
+    previous_filing_id: Optional[int] = None
+    previous_accession_number: Optional[str] = None
+    activities: List[HoldingActivity] = []
+
+
+class ChangesResponse(BaseModel):
+    """Cursor-paginated change feed response for content-hub."""
+
+    items: List[FilingEnvelope]
+    next_cursor: Optional[str] = None
+    has_more: bool = False
+
+
+class ChangesHeadResponse(BaseModel):
+    """Head cursor response so pollers can tail from now."""
+
+    head_cursor: str
+

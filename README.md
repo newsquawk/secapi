@@ -8,11 +8,12 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
 - [✨ Key Features & Feeds](#-key-features--feeds)
 - [📡 API Endpoints Reference](#-api-endpoints-reference)
   - [1. Activity Feeds & Story Streams](#1-activity-feeds--story-streams)
-  - [2. Institutional Flow & Market Leaderboards](#2-institutional-flow--market-leaderboards)
-  - [3. Manager & Company Endpoints](#3-manager--company-endpoints)
-  - [4. Filings & Detailed Holdings](#4-filings--detailed-holdings)
-  - [5. Portfolio Comparison & Analysis](#5-portfolio-comparison--analysis)
-  - [6. AI Summaries & Health Check](#6-ai-summaries--health-check)
+  - [2. Real-Time Change Feed & Stream (Sync Contract)](#2-real-time-change-feed--stream-sync-contract)
+  - [3. Institutional Flow & Market Leaderboards](#3-institutional-flow--market-leaderboards)
+  - [4. Manager & Company Endpoints](#4-manager--company-endpoints)
+  - [5. Filings & Detailed Holdings](#5-filings--detailed-holdings)
+  - [6. Portfolio Comparison & Analysis](#6-portfolio-comparison--analysis)
+  - [7. AI Summaries & Health Check](#7-ai-summaries--health-check)
 - [🧪 Running Tests](#-running-tests)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
@@ -23,6 +24,7 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
 
 ## ✨ Key Features & Feeds
 
+- **Real-Time Sync Stream (`/stream` & `/changes/{source}`)**: Event-driven SSE doorbell and cursor-paginated change feed for downstream ingestion (`content-hub`), delivering filing envelopes with full holding activities.
 - **Options Radar (`/activity/latest/options`)**: Tracks institutional Put & Call options trades (new positions, closed positions, increases, decreases) with filtering by ticker, contract type, action, and dollar value.
 - **Stock Activity Feed (`/activity/latest/v3`)**: Flat stream of common stock portfolio changes across recently processed 13F filings.
 - **Curated Stories (`/stories/latest/v2`)**: Generates structured summary cards showing top position changes for each filing.
@@ -141,7 +143,90 @@ Aggregates recent filings into structured story cards highlighting top new, clos
 
 ---
 
-### 2. Institutional Flow & Market Leaderboards
+### 2. Real-Time Change Feed & Stream (Sync Contract)
+
+High-performance event-driven ingestion pipeline designed for downstream consumers (`content-hub`). Delivers filing-level envelopes containing enriched holding activity changes (`activities[]`) without requiring clients to crawl historical data or poll in tight loops.
+
+#### `GET /changes/head` — Latest Cursor Bookmark
+Returns the highest `filing_id` currently recorded in PostgreSQL. Allows sync pollers on first startup to tail from the current moment forward rather than backfilling all 288k historical filings.
+* **Response Model**: `ChangesHeadResponse`
+* **Response**: `{"head_cursor": "340190"}`
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/changes/head"
+  ```
+
+#### `GET /changes/{source}` — Cursor-Paginated Change Feed
+Drains changes page-by-page. For each filing, returns top-level metadata (`accession_number`, `cik`, `company_name`, `form_type`, `aum`) and the full array of `activities[]` (holding deltas with `weight_pct`, `value_pct`, `form_type`).
+* **Path Parameters**: `source` — `stocks` (common stocks), `options` (derivatives), or `newsquawk-sec-filings-stocks`.
+* **Query Parameters**:
+  * `cursor` *(string, optional)*: Exclusive starting filing ID. If omitted, starts from the beginning.
+  * `limit` *(int, default=50, 1-100)*: Maximum number of filings per page.
+* **Response Model**: `ChangesResponse`
+* **Response Format**:
+  ```json
+  {
+    "items": [
+      {
+        "filing_id": 288001,
+        "accession_number": "0001067983-26-000012",
+        "cik": "0001067983",
+        "company_name": "BERKSHIRE HATHAWAY INC",
+        "form_type": "13F-HR",
+        "filing_date": "2026-02-14",
+        "period_of_report": "2025-12-31",
+        "aum": 299253556246,
+        "previous_filing_id": 285400,
+        "previous_accession_number": "0001067983-25-000098",
+        "activities": [
+          {
+            "issuer_name": "APPLE INC",
+            "cusip": "037833100",
+            "ticker": "AAPL",
+            "change_type": "increased",
+            "current_shares": 915560382,
+            "current_value": 150975906991,
+            "current_price_per_share": 164.90,
+            "weight_pct": 46.4385,
+            "value_pct": 29.81,
+            "form_type": "13F-HR"
+          }
+        ]
+      }
+    ],
+    "next_cursor": "288050",
+    "has_more": true
+  }
+  ```
+  *(When no further filings exist beyond `cursor`, `next_cursor` is `null` and `has_more` is `false`)*.
+* **Example**:
+  ```bash
+  curl "http://localhost:8000/changes/stocks?cursor=340000&limit=25"
+  ```
+
+#### `GET /stream` — Real-Time SSE Doorbell
+Persistent Server-Sent Events (SSE) stream. Whenever `secpoll` or any worker inserts a new 13F filing into PostgreSQL, `secapi` immediately emits a lightweight event notification over the stream. Downstream clients use this signal to trigger a drain on `GET /changes/{source}`.
+* **Headers**: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`
+* **Query Parameters**:
+  * `once` *(boolean, default=false)*: Emit initial connection frame and close immediately (used for automated health probes and connectivity testing).
+* **SSE Event Stream Format**:
+  ```text
+  event: connected
+  data: {"head": "340190"}
+
+  event: change
+  data: {"source": "stocks", "head": "340195"}
+
+  : keepalive
+  ```
+* **Example**:
+  ```bash
+  curl -N "http://localhost:8000/stream"
+  ```
+
+---
+
+### 3. Institutional Flow & Market Leaderboards
 
 #### `GET /api/v1/flow/daily/{identifier}` — Daily Stock Flow Time Series
 Aggregates institutional buying and selling volume grouped by **filing date** for a specific ticker or CUSIP, including net change as a percentage of free float.
@@ -173,7 +258,7 @@ Retrieves the top 50 stocks with the largest absolute net movement across all 13
 
 ---
 
-### 3. Manager & Company Endpoints
+### 4. Manager & Company Endpoints
 
 #### `GET /managers/` — List Investment Managers
 Returns a paginated list of all investment managers.
@@ -203,7 +288,7 @@ Searches filings from managers whose AUM falls within a specified minimum and ma
 
 ---
 
-### 4. Filings & Detailed Holdings
+### 5. Filings & Detailed Holdings
 
 #### `GET /filings/` — Master Filings Stream
 Returns a paginated and sortable list of all processed 13F filings.
@@ -227,7 +312,7 @@ Provides paginated, searchable, and sortable holdings data within a specific fil
 
 ---
 
-### 5. Portfolio Comparison & Analysis
+### 6. Portfolio Comparison & Analysis
 
 #### `GET /analysis/{previous_accession}/{latest_accession}` — Two-Filing Portfolio Comparison
 Compares two filings for a manager and returns a comprehensive breakdown of changes:
@@ -248,7 +333,7 @@ Convenience endpoint that automatically resolves and compares the two most recen
 
 ---
 
-### 6. AI Summaries & Health Check
+### 7. AI Summaries & Health Check
 
 #### `POST /api/ai_summary` — AI Portfolio Summary
 Accepts portfolio changes payload and generates an executive financial summary using DeepSeek LLM.
