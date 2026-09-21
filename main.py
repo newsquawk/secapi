@@ -3491,11 +3491,19 @@ def get_changes_feed(
                 c.company_name,
                 c.cik_number,
                 c.aum,
-                f.previous_filing_id,
-                prev.accession_number AS previous_accession_number
+                pf.filing_id AS previous_filing_id,
+                pf.accession_number AS previous_accession_number
             FROM filings f
             JOIN companies c ON f.company_id = c.company_id
-            LEFT JOIN filings prev ON f.previous_filing_id = prev.filing_id
+            LEFT JOIN LATERAL (
+                SELECT filing_id, accession_number
+                FROM filings
+                WHERE company_id = f.company_id
+                  AND period_of_report < f.period_of_report
+                  AND form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+                ORDER BY period_of_report DESC, filing_date DESC
+                LIMIT 1
+            ) pf ON true
             WHERE f.filing_id > %s
               AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
             ORDER BY f.filing_id ASC
