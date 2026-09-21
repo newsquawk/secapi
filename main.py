@@ -402,10 +402,23 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
+def _is_connection_healthy(conn) -> bool:
+    """Verifies that a database connection is open and capable of executing queries."""
+    if conn is None or getattr(conn, "closed", 1) != 0:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+        return True
+    except Exception:
+        return False
+
+
 def get_db_cursor():
     """
     Dependency that yields a database cursor backed by a connection from the pool
     and ensures the connection is cleanly returned with rollback on error.
+    Automatically validates connection liveness and auto-heals dead pool sockets.
     """
     global db_pool
     conn = None
@@ -421,8 +434,38 @@ def get_db_cursor():
 
     if db_pool is not None:
         try:
-            conn = db_pool.getconn()
-            is_pooled = True
+            # Try acquiring a healthy connection from the pool
+            # Prune any dead sockets (e.g. if PostgreSQL was restarted)
+            for _ in range(5):
+                candidate = db_pool.getconn()
+                if _is_connection_healthy(candidate):
+                    conn = candidate
+                    is_pooled = True
+                    break
+                else:
+                    # Discard dead connection from pool
+                    try:
+                        db_pool.putconn(candidate, close=True)
+                    except Exception:
+                        pass
+
+            # If all pool candidates were dead, re-initialize pool and fallback
+            if conn is None:
+                logger.warning("All pooled connections were dead; re-initializing pool")
+                try:
+                    init_db_pool()
+                    candidate = db_pool.getconn()
+                    if _is_connection_healthy(candidate):
+                        conn = candidate
+                        is_pooled = True
+                    else:
+                        db_pool.putconn(candidate, close=True)
+                        conn = get_db_connection()
+                        is_pooled = False
+                except Exception:
+                    conn = get_db_connection()
+                    is_pooled = False
+
         except PoolError:
             logger.error("Database connection pool exhausted", exc_info=True)
             raise HTTPException(
@@ -440,21 +483,21 @@ def get_db_cursor():
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         yield cursor
     except Exception:
-        if conn and not conn.closed:
+        if conn and not getattr(conn, "closed", 1):
             try:
                 conn.rollback()
             except Exception:
                 pass
         raise
     finally:
-        if cursor and not cursor.closed:
+        if cursor and not getattr(cursor, "closed", 1):
             try:
                 cursor.close()
             except Exception:
                 pass
         if conn:
             if is_pooled and db_pool is not None:
-                if conn.closed:
+                if getattr(conn, "closed", 1):
                     try:
                         db_pool.putconn(conn, close=True)
                     except Exception:
@@ -462,12 +505,14 @@ def get_db_cursor():
                 else:
                     try:
                         conn.rollback()
-                    except Exception:
-                        pass
-                    try:
                         db_pool.putconn(conn)
                     except Exception:
-                        logger.error("Failed to return connection to pool", exc_info=True)
+                        # Rollback failed: connection is severed or invalid.
+                        # Discard with close=True so it never poisons the pool!
+                        try:
+                            db_pool.putconn(conn, close=True)
+                        except Exception:
+                            pass
             else:
                 try:
                     conn.close()
@@ -3673,8 +3718,14 @@ async def stream_changes(
             is_pooled = False
             try:
                 if db_pool is not None:
-                    conn = db_pool.getconn()
-                    is_pooled = True
+                    candidate = db_pool.getconn()
+                    if _is_connection_healthy(candidate):
+                        conn = candidate
+                        is_pooled = True
+                    else:
+                        db_pool.putconn(candidate, close=True)
+                        conn = get_db_connection()
+                        is_pooled = False
                 else:
                     conn = get_db_connection()
 
@@ -3687,14 +3738,24 @@ async def stream_changes(
                     return row[0] if row else 0
             except Exception as e:
                 logger.warning(f"Error querying max filing_id in stream: {e}")
+                if conn and is_pooled and db_pool is not None:
+                    try:
+                        db_pool.putconn(conn, close=True)
+                        conn = None
+                    except Exception:
+                        pass
                 return 0
             finally:
                 if conn:
                     if is_pooled and db_pool is not None:
                         try:
+                            conn.rollback()
                             db_pool.putconn(conn)
                         except Exception:
-                            pass
+                            try:
+                                db_pool.putconn(conn, close=True)
+                            except Exception:
+                                pass
                     else:
                         try:
                             conn.close()
