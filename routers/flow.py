@@ -341,8 +341,8 @@ def get_top_market_changes_today(
                 SELECT 
                     UPPER(i.cusip) AS cusip,
                     SUM(h.shares_or_principal_amount) AS current_shares,
-                    SUM(CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END) AS current_value 
-                FROM holdings h
+                    SUM(h.value) AS current_value 
+                FROM holdings_normalised h
                 JOIN issuers i ON h.issuer_id = i.issuer_id
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.current_filing_id
@@ -354,8 +354,8 @@ def get_top_market_changes_today(
                 SELECT 
                     UPPER(i.cusip) AS cusip,
                     SUM(h.shares_or_principal_amount) AS previous_shares,
-                    SUM(CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END) AS previous_value 
-                FROM holdings h
+                    SUM(h.value) AS previous_value 
+                FROM holdings_normalised h
                 JOIN issuers i ON h.issuer_id = i.issuer_id
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.previous_filing_id
