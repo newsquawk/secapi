@@ -43,6 +43,14 @@ from sec_models import (
     FilingEnvelope,
     ChangesResponse,
     ChangesHeadResponse,
+    ManagerSummary,
+    ManagerFilingsResponse,
+    CompanySearchResult,
+    CompanyAumRank,
+    FilingsListResponse,
+    FilingDetail,
+    FilingsByAumResponse,
+    DataTablesHoldingsResponse,
 )
 
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
@@ -515,8 +523,8 @@ def _format_address(
     return full_address
 
 
-@app.get("/managers", response_model=list[dict])
-@app.get("/managers/", response_model=list[dict], include_in_schema=False)
+@app.get("/managers", response_model=List[ManagerSummary], tags=["Managers"])
+@app.get("/managers/", response_model=List[ManagerSummary], include_in_schema=False)
 def get_managers(
     request: Request,
     response: Response = Response(),
@@ -592,7 +600,7 @@ def get_managers(
     return companies
 
 
-@app.get("/managers/{cik}", response_model=dict)
+@app.get("/managers/{cik}", response_model=ManagerSummary, tags=["Managers"])
 def get_manager(
     request: Request,
     cik: str,
@@ -625,8 +633,32 @@ def get_manager(
     """
 
     try:
-        logger.info(f"Executing query to fetch manager with CIK={cik}")
-        db.execute(query, (cik,))
+        clean_cik = cik.strip().lstrip("0") or "0"
+        logger.info(f"Executing query to fetch manager with CIK={cik} (clean={clean_cik})")
+        db.execute(
+            """
+            SELECT
+                cik_number,
+                company_name, 
+                company_phone,
+                company_mail_street1,
+                company_mail_street2,
+                company_mail_city,
+                company_mail_state,
+                company_mail_state_desc,
+                company_zipcode,
+                company_business_street1,
+                company_business_street2,
+                company_business_city,
+                company_business_state,
+                company_business_state_desc,
+                company_business_zipcode
+            FROM companies
+            WHERE cik_number = %s OR cik_number = %s
+            LIMIT 1;
+            """,
+            (cik, clean_cik),
+        )
         result = db.fetchone()
 
         if not result:
@@ -665,12 +697,14 @@ def get_manager(
                 "public, max-age=3600, stale-while-revalidate=7200"
             )
         return manager_data
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching manager with CIK {cik}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/managers/{cik}/filings")
+@app.get("/managers/{cik}/filings", response_model=ManagerFilingsResponse, tags=["Managers"])
 def get_manager_filings(
     request: Request,
     cik: str,
@@ -687,7 +721,11 @@ def get_manager_filings(
         logger.info(
             f"Fetching filings for manager with CIK={cik}, limit={limit}, offset={offset}"
         )
-        db.execute("SELECT company_id FROM companies WHERE cik_number = %s", (cik,))
+        clean_cik = cik.strip().lstrip("0") or "0"
+        db.execute(
+            "SELECT company_id FROM companies WHERE cik_number = %s OR cik_number = %s LIMIT 1",
+            (cik, clean_cik),
+        )
         company: dict = db.fetchone()  # type: ignore
         if not company:
             logger.error(f"Manager with CIK {cik} not found when fetching filings.")
@@ -767,8 +805,8 @@ def get_manager_filings(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/filings", response_model=dict)
-@app.get("/filings/", response_model=dict, include_in_schema=False)
+@app.get("/filings", response_model=FilingsListResponse, tags=["Filings"])
+@app.get("/filings/", response_model=FilingsListResponse, include_in_schema=False)
 def get_filings(
     request: Request,
     limit: int = Query(100, description="Number of items to return", ge=1, le=100),
@@ -917,7 +955,7 @@ def get_filings(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/filings/{accession_number}", response_model=dict)
+@app.get("/filings/{accession_number}", response_model=FilingDetail, tags=["Filings"])
 def get_filing_by_accession(
     request: Request,
     accession_number: str,
@@ -970,7 +1008,7 @@ def get_filing_by_accession(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/holdings/{accession_number}", response_model=dict)
+@app.get("/holdings/{accession_number}", response_model=DataTablesHoldingsResponse, tags=["Holdings"])
 def get_holding_by_accession_number(
     request: Request,
     accession_number: str,
@@ -3705,7 +3743,7 @@ async def stream_changes(
     )
 
 
-@app.get("/api/search/companies", response_model=List[Dict[str, str]])
+@app.get("/api/search/companies", response_model=List[CompanySearchResult], tags=["Search"])
 def search_companies(
     request: Request,
     q: str = Query(
@@ -4147,7 +4185,7 @@ def get_aggregate_stock_flow(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/api/v1/search/companies_by_aum", response_model=list[dict])
+@app.get("/api/v1/search/companies_by_aum", response_model=List[CompanyAumRank], tags=["Search"])
 def search_companies_by_aum(
     request: Request,
     min_aum: Optional[int] = Query(None, description="Minimum AUM"),
@@ -4204,7 +4242,7 @@ def search_companies_by_aum(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@app.get("/api/v1/search/filings_by_aum", response_model=dict)
+@app.get("/api/v1/search/filings_by_aum", response_model=FilingsByAumResponse, tags=["Search"])
 def search_filings_by_aum(
     request: Request,
     min_aum: Optional[int] = Query(None, description="Minimum AUM filter"),

@@ -179,3 +179,92 @@ class ChangesHeadResponse(BaseModel):
 
     head_cursor: str
 
+
+class ManagerSummary(BaseModel):
+    cik: str
+    company_name: Optional[str] = None
+    company_phone: Optional[str] = None
+    mailing_address: Optional[str] = None
+    business_address: Optional[str] = None
+
+
+class ManagerFilingsPagination(BaseModel):
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+    next_offset: Optional[int] = None
+
+
+class ManagerFilingsResponse(BaseModel):
+    filings: List[Filing]
+    pagination: ManagerFilingsPagination
+
+
+class CompanySearchResult(BaseModel):
+    name: str
+    cik: str
+
+
+class CompanyAumRank(BaseModel):
+    cik: str
+    company_name: str
+    aum: Optional[int] = None
+
+
+class FilingListItem(BaseModel):
+    accession_number: str
+    form_type: str
+    filing_date: dt.date
+    period_of_report: dt.date
+    file_number: Optional[str] = None
+    filing_directory: Optional[str] = None
+    created_at: Optional[dt.datetime] = None
+    updated_at: Optional[dt.datetime] = None
+    company_name: Optional[str] = None
+    cik_number: Optional[str] = None
+    aum: Optional[int] = None
+
+
+class FilingsPagination(BaseModel):
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
+class FilingsSorting(BaseModel):
+    current_sort_by: str
+    current_sort_order: str
+
+
+class FilingsListResponse(BaseModel):
+    filings: List[FilingListItem]
+    pagination: FilingsPagination
+    sorting: FilingsSorting
+
+
+class FilingDetail(BaseModel):
+    accession_number: str
+    form_type: str
+    filing_date: dt.date
+    period_of_report: dt.date
+    file_number: Optional[str] = None
+    filing_directory: Optional[str] = None
+    created_at: Optional[dt.datetime] = None
+    updated_at: Optional[dt.datetime] = None
+    company_name: Optional[str] = None
+    cik_number: Optional[str] = None
+
+
+class FilingsByAumResponse(BaseModel):
+    filings: List[FilingListItem]
+    pagination: FilingsPagination
+
+
+class DataTablesHoldingsResponse(BaseModel):
+    draw: int
+    recordsTotal: int
+    recordsFiltered: int
+    data: List[Dict[str, Any]]
+
