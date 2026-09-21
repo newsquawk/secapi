@@ -84,11 +84,21 @@ class HoldingsRequest(BaseModel):
     decreased_holdings: List[Dict[str, Any]]
 
 
+class PaginationMetadata(BaseModel):
+    """Unified pagination schema used across all collection endpoints."""
+    limit: int
+    offset: int
+    total: Optional[int] = None
+    has_more: bool
+    next_offset: Optional[int] = None
+
+
 class LatestActivityResponse(BaseModel):
     """The response for the latest activity/headline list endpoint."""
 
     activities: List[HoldingActivity]
     has_next_page: bool = False
+    pagination: Optional[PaginationMetadata] = None
 
 
 class FlowPoint(BaseModel):
@@ -188,17 +198,21 @@ class ManagerSummary(BaseModel):
     business_address: Optional[str] = None
 
 
-class ManagerFilingsPagination(BaseModel):
-    limit: int
-    offset: int
-    total: int
-    has_more: bool
-    next_offset: Optional[int] = None
+# Backward-compatible aliases
+ManagerFilingsPagination = PaginationMetadata
+FilingsPagination = PaginationMetadata
+FilingsByAumPagination = PaginationMetadata
+
+
+class ManagersListResponse(BaseModel):
+    """Enveloped response for managers collection."""
+    managers: List[ManagerSummary]
+    pagination: PaginationMetadata
 
 
 class ManagerFilingsResponse(BaseModel):
     filings: List[Filing]
-    pagination: ManagerFilingsPagination
+    pagination: PaginationMetadata
 
 
 class CompanySearchResult(BaseModel):
@@ -210,6 +224,12 @@ class CompanyAumRank(BaseModel):
     cik: str
     company_name: str
     aum: Optional[int] = None
+
+
+class CompaniesByAumResponse(BaseModel):
+    """Enveloped response for company search by AUM."""
+    companies: List[CompanyAumRank]
+    pagination: PaginationMetadata
 
 
 class FilingListItem(BaseModel):
@@ -226,13 +246,6 @@ class FilingListItem(BaseModel):
     aum: Optional[int] = None
 
 
-class FilingsPagination(BaseModel):
-    limit: int
-    offset: int
-    total: int
-    has_more: bool
-
-
 class FilingsSorting(BaseModel):
     current_sort_by: str
     current_sort_order: str
@@ -240,7 +253,7 @@ class FilingsSorting(BaseModel):
 
 class FilingsListResponse(BaseModel):
     filings: List[FilingListItem]
-    pagination: FilingsPagination
+    pagination: PaginationMetadata
     sorting: FilingsSorting
 
 

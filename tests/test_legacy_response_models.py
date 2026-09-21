@@ -19,7 +19,11 @@ from sec_models import (
     CompanyAumRank,
     FilingsListResponse,
     FilingsByAumResponse,
+    ManagersListResponse,
+    CompaniesByAumResponse,
+    LatestActivityResponse,
 )
+from routers.activity import LatestStoriesResponse
 
 
 class TestLegacyResponseModels(unittest.TestCase):
@@ -35,6 +39,21 @@ class TestLegacyResponseModels(unittest.TestCase):
         if data:
             item = ManagerSummary(**data[0])
             self.assertTrue(item.cik)
+        self.assertIn("x-total-count", r.headers)
+        self.assertIn("x-has-more", r.headers)
+        self.assertIn("x-next-offset", r.headers)
+        self.assertEqual(r.headers.get("x-next-offset"), "2")
+
+    def test_get_managers_enveloped(self):
+        r = self.client.get("/managers?limit=2&envelope=true")
+        self.assertEqual(r.status_code, 200)
+        res = ManagersListResponse(**r.json())
+        self.assertIsInstance(res.managers, list)
+        self.assertEqual(res.pagination.limit, 2)
+        self.assertEqual(res.pagination.offset, 0)
+        self.assertTrue(res.pagination.has_more)
+        self.assertEqual(res.pagination.next_offset, 2)
+        self.assertGreater(res.pagination.total, 0)
 
     def test_get_manager_detail_response_model(self):
         # 0001067983 (Berkshire Hathaway)
@@ -48,6 +67,9 @@ class TestLegacyResponseModels(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         res = ManagerFilingsResponse(**r.json())
         self.assertGreater(len(res.filings), 0)
+        self.assertIn("x-total-count", r.headers)
+        self.assertIn("x-has-more", r.headers)
+        self.assertIsNotNone(res.pagination.next_offset)
 
     def test_get_filings_response_model(self):
         r = self.client.get("/filings?limit=2")
@@ -55,6 +77,9 @@ class TestLegacyResponseModels(unittest.TestCase):
         res = FilingsListResponse(**r.json())
         self.assertEqual(len(res.filings), 2)
         self.assertEqual(res.sorting.current_sort_by, "filing_date")
+        self.assertIn("x-total-count", r.headers)
+        self.assertIn("x-has-more", r.headers)
+        self.assertEqual(res.pagination.next_offset, 2)
 
     def test_search_companies_response_model(self):
         r = self.client.get("/api/search/companies?q=Apple")
@@ -73,12 +98,56 @@ class TestLegacyResponseModels(unittest.TestCase):
         if data:
             item = CompanyAumRank(**data[0])
             self.assertTrue(item.cik)
+        self.assertIn("x-total-count", r.headers)
+        self.assertIn("x-has-more", r.headers)
+        self.assertEqual(r.headers.get("x-next-offset"), "2")
+
+    def test_search_companies_by_aum_enveloped(self):
+        r = self.client.get("/api/v1/search/companies_by_aum?limit=2&envelope=true")
+        self.assertEqual(r.status_code, 200)
+        res = CompaniesByAumResponse(**r.json())
+        self.assertIsInstance(res.companies, list)
+        self.assertEqual(res.pagination.limit, 2)
+        self.assertEqual(res.pagination.offset, 0)
+        self.assertTrue(res.pagination.has_more)
+        self.assertEqual(res.pagination.next_offset, 2)
+        self.assertGreater(res.pagination.total, 0)
 
     def test_search_filings_by_aum_response_model(self):
         r = self.client.get("/api/v1/search/filings_by_aum?limit=2")
         self.assertEqual(r.status_code, 200)
         res = FilingsByAumResponse(**r.json())
         self.assertEqual(len(res.filings), 2)
+        self.assertIn("x-total-count", r.headers)
+        self.assertIn("x-has-more", r.headers)
+        self.assertEqual(res.pagination.next_offset, 2)
+
+    def test_activity_v3_pagination(self):
+        r = self.client.get("/activity/latest/v3?limit=2")
+        self.assertEqual(r.status_code, 200)
+        res = LatestActivityResponse(**r.json())
+        self.assertIn("x-has-more", r.headers)
+        self.assertIsNotNone(res.pagination)
+        self.assertEqual(res.pagination.limit, 2)
+        self.assertEqual(res.pagination.offset, 0)
+
+    def test_options_activity_pagination(self):
+        r = self.client.get("/activity/latest/options?limit=2")
+        self.assertEqual(r.status_code, 200)
+        res = LatestActivityResponse(**r.json())
+        self.assertIn("x-has-more", r.headers)
+        self.assertIsNotNone(res.pagination)
+        self.assertEqual(res.pagination.limit, 2)
+        self.assertEqual(res.pagination.offset, 0)
+
+    def test_stories_v2_pagination(self):
+        r = self.client.get("/stories/latest/v2?limit=2")
+        self.assertEqual(r.status_code, 200)
+        res = LatestStoriesResponse(**r.json())
+        self.assertIn("x-has-more", r.headers)
+        self.assertIsNotNone(res.pagination)
+        self.assertEqual(res.pagination.limit, 2)
+        self.assertEqual(res.pagination.offset, 0)
 
 
 if __name__ == "__main__":

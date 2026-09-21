@@ -12,7 +12,7 @@ from config import (
     logger,
 )
 from database import get_db_cursor, INTERNAL_ERROR_DETAIL
-from sec_models import LatestActivityResponse, HoldingActivity
+from sec_models import LatestActivityResponse, HoldingActivity, PaginationMetadata
 from utils import resolve_identifiers
 
 router = APIRouter()
@@ -70,6 +70,7 @@ class LatestStoriesResponse(BaseModel):
 
     stories: List[StorySummary]
     has_next_page: bool = False
+    pagination: Optional[PaginationMetadata] = None
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +684,36 @@ def get_latest_stories_v2(
         has_next_page = len(candidate_filings) > limit
         candidates_to_process = candidate_filings[:limit]
 
+        next_offset = offset + limit if has_next_page else None
+        pagination = PaginationMetadata(
+            limit=limit,
+            offset=offset,
+            total=None,
+            has_more=has_next_page,
+            next_offset=next_offset,
+        )
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Has-More"] = str(has_next_page).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
+
         if not candidates_to_process:
             logger.info("No candidate filings found for the given limit and offset.")
-            return LatestStoriesResponse(stories=[])
+            return LatestStoriesResponse(
+                stories=[],
+                has_next_page=False,
+                pagination=PaginationMetadata(
+                    limit=limit,
+                    offset=offset,
+                    total=None,
+                    has_more=False,
+                    next_offset=None,
+                ),
+            )
 
         candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
         params = {
@@ -702,7 +730,11 @@ def get_latest_stories_v2(
 
         if not valid_filings:
             logger.info("No valid filings found after filtering.")
-            return LatestStoriesResponse(stories=[])
+            return LatestStoriesResponse(
+                stories=[],
+                has_next_page=has_next_page,
+                pagination=pagination,
+            )
 
         filing_ids_to_process = set()
         filing_data_tuples = []
@@ -883,9 +915,11 @@ def get_latest_stories_v2(
                 )
             )
 
-        if response:
-            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-        return LatestStoriesResponse(stories=story_summaries, has_next_page=has_next_page)
+        return LatestStoriesResponse(
+            stories=story_summaries,
+            has_next_page=has_next_page,
+            pagination=pagination,
+        )
 
     except Exception as e:
         logger.error(f"Error fetching latest stories v2: {str(e)}", exc_info=True)
@@ -912,8 +946,35 @@ def get_latest_activity_v3(
         has_next_page = len(candidate_filings) > limit
         candidates_to_process = candidate_filings[:limit]
 
+        next_offset = offset + limit if has_next_page else None
+        pagination = PaginationMetadata(
+            limit=limit,
+            offset=offset,
+            total=None,
+            has_more=has_next_page,
+            next_offset=next_offset,
+        )
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Has-More"] = str(has_next_page).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
+
         if not candidates_to_process:
-            return LatestActivityResponse(activities=[])
+            return LatestActivityResponse(
+                activities=[],
+                has_next_page=False,
+                pagination=PaginationMetadata(
+                    limit=limit,
+                    offset=offset,
+                    total=None,
+                    has_more=False,
+                    next_offset=None,
+                ),
+            )
 
         candidate_filing_ids = [f["filing_id"] for f in candidates_to_process]
         params = {
@@ -928,7 +989,11 @@ def get_latest_activity_v3(
         ]
 
         if not valid_filings:
-            return LatestActivityResponse(activities=[])
+            return LatestActivityResponse(
+                activities=[],
+                has_next_page=has_next_page,
+                pagination=pagination,
+            )
 
         filing_ids_to_process = set()
         filing_data_tuples = []
@@ -977,9 +1042,11 @@ def get_latest_activity_v3(
             activity_dict["ticker"] = CUSIP_TO_TICKER.get(activity_dict["cusip"])
             activities.append(HoldingActivity(**activity_dict))
 
-        if response:
-            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-        return LatestActivityResponse(activities=activities, has_next_page=has_next_page)
+        return LatestActivityResponse(
+            activities=activities,
+            has_next_page=has_next_page,
+            pagination=pagination,
+        )
 
     except Exception as e:
         logger.error("Failed to fetch latest activity v3", exc_info=True)
@@ -1076,8 +1143,35 @@ def get_latest_options_activity(
         has_next_page = len(candidate_filings) > actual_limit
         valid_filings = candidate_filings[:actual_limit]
 
+        next_offset = actual_offset + actual_limit if has_next_page else None
+        pagination = PaginationMetadata(
+            limit=actual_limit,
+            offset=actual_offset,
+            total=None,
+            has_more=has_next_page,
+            next_offset=next_offset,
+        )
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Has-More"] = str(has_next_page).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(actual_limit)
+            response.headers["X-Offset"] = str(actual_offset)
+
         if not valid_filings:
-            return LatestActivityResponse(activities=[], has_next_page=False)
+            return LatestActivityResponse(
+                activities=[],
+                has_next_page=False,
+                pagination=PaginationMetadata(
+                    limit=actual_limit,
+                    offset=actual_offset,
+                    total=None,
+                    has_more=False,
+                    next_offset=None,
+                ),
+            )
 
         valid_filing_ids = {f["filing_id"] for f in valid_filings}
 
@@ -1140,9 +1234,11 @@ def get_latest_options_activity(
             )
             activities.append(HoldingActivity(**activity_dict))
 
-        if response:
-            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-        return LatestActivityResponse(activities=activities, has_next_page=has_next_page)
+        return LatestActivityResponse(
+            activities=activities,
+            has_next_page=has_next_page,
+            pagination=pagination,
+        )
 
     except HTTPException:
         raise

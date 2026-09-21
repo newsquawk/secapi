@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
@@ -14,6 +14,9 @@ from sec_models import (
     CompanySearchResult,
     CompanyAumRank,
     FilingsByAumResponse,
+    PaginationMetadata,
+    ManagersListResponse,
+    CompaniesByAumResponse,
 )
 
 router = APIRouter()
@@ -69,14 +72,25 @@ def _format_holdings_text(d: dict) -> str:
 # ---------------------------------------------------------------------------
 # Managers Endpoints
 # ---------------------------------------------------------------------------
-@router.get("/managers", response_model=List[ManagerSummary], tags=["Managers"])
-@router.get("/managers/", response_model=List[ManagerSummary], include_in_schema=False)
+@router.get(
+    "/managers",
+    response_model=Union[List[ManagerSummary], ManagersListResponse],
+    tags=["Managers"],
+)
+@router.get(
+    "/managers/",
+    response_model=Union[List[ManagerSummary], ManagersListResponse],
+    include_in_schema=False,
+)
 def get_managers(
     request: Request,
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    envelope: bool = Query(
+        False, description="Envelope response with pagination metadata"
+    ),
 ):
     """Retrieve all managers with pagination."""
     query = """
@@ -133,8 +147,34 @@ def get_managers(
         )
 
     logger.info(f"Fetched {len(companies)} managers from the database.")
+
+    db.execute("SELECT count(*) AS total FROM companies")
+    total_row = db.fetchone()
+    total_managers = total_row["total"] if total_row else len(companies)
+    has_more = (offset + len(companies)) < total_managers
+    next_offset = offset + limit if has_more else None
+
     if response:
         response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
+        response.headers["X-Total-Count"] = str(total_managers)
+        response.headers["X-Has-More"] = str(has_more).lower()
+        if next_offset is not None:
+            response.headers["X-Next-Offset"] = str(next_offset)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Offset"] = str(offset)
+
+    if envelope:
+        return ManagersListResponse(
+            managers=companies,
+            pagination=PaginationMetadata(
+                limit=limit,
+                offset=offset,
+                total=total_managers,
+                has_more=has_more,
+                next_offset=next_offset,
+            ),
+        )
+
     return companies
 
 
@@ -242,6 +282,12 @@ def get_manager_filings(
 
         if total_count == 0:
             logger.info(f"No filings found for manager with CIK={cik}")
+            if response:
+                response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+                response.headers["X-Total-Count"] = "0"
+                response.headers["X-Has-More"] = "false"
+                response.headers["X-Limit"] = str(limit)
+                response.headers["X-Offset"] = str(offset)
             return {
                 "filings": [],
                 "pagination": {
@@ -276,9 +322,16 @@ def get_manager_filings(
 
         filings = [Filing(**row) for row in filings_data]  # type: ignore
         has_more = (offset + len(filings)) < total_count
+        next_offset = offset + limit if has_more else None
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Total-Count"] = str(total_count)
+            response.headers["X-Has-More"] = str(has_more).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
 
         return {
             "filings": filings,
@@ -287,7 +340,7 @@ def get_manager_filings(
                 "offset": offset,
                 "total": total_count,
                 "has_more": has_more,
-                "next_offset": offset + limit if has_more else None,
+                "next_offset": next_offset,
             },
         }
     except HTTPException:
@@ -381,6 +434,12 @@ def get_filings(
 
             if total_count == 0:
                 logger.info("No filings found in the database.")
+                if response:
+                    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+                    response.headers["X-Total-Count"] = "0"
+                    response.headers["X-Has-More"] = "false"
+                    response.headers["X-Limit"] = str(limit)
+                    response.headers["X-Offset"] = str(offset)
                 return {
                     "filings": [],
                     "pagination": {
@@ -388,6 +447,7 @@ def get_filings(
                         "offset": offset,
                         "total": 0,
                         "has_more": False,
+                        "next_offset": None,
                     },
                     "sorting": {
                         "current_sort_by": sort_by,
@@ -417,9 +477,16 @@ def get_filings(
             filings_data = db.fetchall()
 
         has_more = (offset + len(filings_data)) < total_count
+        next_offset = offset + limit if has_more else None
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Total-Count"] = str(total_count)
+            response.headers["X-Has-More"] = str(has_more).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
 
         return {
             "filings": filings_data,
@@ -428,6 +495,7 @@ def get_filings(
                 "offset": offset,
                 "total": total_count,
                 "has_more": has_more,
+                "next_offset": next_offset,
             },
             "sorting": {
                 "current_sort_by": sort_by,
@@ -694,16 +762,33 @@ def search_companies(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@router.get("/api/v1/search/companies_by_aum", response_model=List[CompanyAumRank], tags=["Search"])
+@router.get(
+    "/api/v1/search/companies_by_aum",
+    response_model=Union[List[CompanyAumRank], CompaniesByAumResponse],
+    tags=["Search"],
+)
 def search_companies_by_aum(
     request: Request,
     min_aum: Optional[int] = Query(None, description="Minimum AUM"),
     max_aum: Optional[int] = Query(None, description="Maximum AUM"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    envelope: bool = Query(
+        False, description="Envelope response with pagination metadata"
+    ),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """Search for companies within a specific Assets Under Management (AUM) range."""
+    count_query = "SELECT count(*) AS total FROM companies WHERE 1=1"
+    count_params = []
+    if min_aum is not None:
+        count_query += " AND aum >= %s"
+        count_params.append(min_aum)
+    if max_aum is not None:
+        count_query += " AND aum <= %s"
+        count_params.append(max_aum)
+
     query = """
         SELECT
             cik_number,
@@ -726,6 +811,9 @@ def search_companies_by_aum(
     params.extend([limit, offset])
 
     try:
+        db.execute(count_query, tuple(count_params))
+        total_row = db.fetchone()
+
         db.execute(query, tuple(params))
         results = db.fetchall()
 
@@ -737,6 +825,32 @@ def search_companies_by_aum(
             }
             for row in results
         ]
+
+        total_count = total_row["total"] if total_row else len(companies)
+        has_more = (offset + len(companies)) < total_count
+        next_offset = offset + limit if has_more else None
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Total-Count"] = str(total_count)
+            response.headers["X-Has-More"] = str(has_more).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
+
+        if envelope:
+            return CompaniesByAumResponse(
+                companies=companies,
+                pagination=PaginationMetadata(
+                    limit=limit,
+                    offset=offset,
+                    total=total_count,
+                    has_more=has_more,
+                    next_offset=next_offset,
+                ),
+            )
+
         return companies
 
     except Exception as e:
@@ -757,6 +871,7 @@ def search_filings_by_aum(
         description="Sort column: 'filing_date' or 'created_at' or 'period_of_report'",
     ),
     sort_order: str = Query("desc", description="Sort order: 'asc' or 'desc'"),
+    response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """Search and filter filings based on Company AUM and specific CIKs with pagination and sorting."""
@@ -807,6 +922,12 @@ def search_filings_by_aum(
         total_count = db.fetchone()["count"]
 
         if total_count == 0:
+            if response:
+                response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+                response.headers["X-Total-Count"] = "0"
+                response.headers["X-Has-More"] = "false"
+                response.headers["X-Limit"] = str(limit)
+                response.headers["X-Offset"] = str(offset)
             return {
                 "filings": [],
                 "pagination": {
@@ -814,6 +935,7 @@ def search_filings_by_aum(
                     "offset": offset,
                     "total": 0,
                     "has_more": False,
+                    "next_offset": None,
                 },
             }
 
@@ -835,6 +957,16 @@ def search_filings_by_aum(
         filings_data = db.fetchall()
 
         has_more = (offset + len(filings_data)) < total_count
+        next_offset = offset + limit if has_more else None
+
+        if response:
+            response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
+            response.headers["X-Total-Count"] = str(total_count)
+            response.headers["X-Has-More"] = str(has_more).lower()
+            if next_offset is not None:
+                response.headers["X-Next-Offset"] = str(next_offset)
+            response.headers["X-Limit"] = str(limit)
+            response.headers["X-Offset"] = str(offset)
 
         return {
             "filings": filings_data,
@@ -843,6 +975,7 @@ def search_filings_by_aum(
                 "offset": offset,
                 "total": total_count,
                 "has_more": has_more,
+                "next_offset": next_offset,
             },
         }
 
