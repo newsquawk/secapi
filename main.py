@@ -156,9 +156,14 @@ def load_json_mappings():
         for ticker, cusip_list in TICKER_TO_CUSIP.items():
             if isinstance(cusip_list, list):
                 for c in cusip_list:
-                    CUSIP_TO_TICKER[c] = ticker
+                    if isinstance(c, str):
+                        CUSIP_TO_TICKER[c] = ticker
+                        CUSIP_TO_TICKER[c.upper()] = ticker
+                        CUSIP_TO_TICKER[c.lower()] = ticker
             elif isinstance(cusip_list, str):
                 CUSIP_TO_TICKER[cusip_list] = ticker
+                CUSIP_TO_TICKER[cusip_list.upper()] = ticker
+                CUSIP_TO_TICKER[cusip_list.lower()] = ticker
 
         logger.info("Loaded JSON mappings for CUSIP<->CIK<->Ticker")
     except Exception as e:
@@ -4271,11 +4276,16 @@ def get_top_market_changes_today(
             status_code=400, detail="Invalid sort_by option. Use 'value' or 'shares'."
         )
 
-    # Determine safe SQL ordering expression based on choice
-    order_by_clause = (
+    # Determine safe SQL ordering expressions based on choice
+    order_by_inner = (
         "ABS(SUM(hc.value_change))"
         if sort_by == "value"
         else "ABS(SUM(hc.share_change))"
+    )
+    order_by_outer = (
+        "ABS(tm.net_value_change)"
+        if sort_by == "value"
+        else "ABS(tm.net_shares_change)"
     )
 
     query = f"""
@@ -4302,10 +4312,10 @@ def get_top_market_changes_today(
         FROM RelevantFilings rf
     ),
     HoldingsComparison AS (
-        -- 3. Side-by-side position changes per company, filtering for Common Stock 
-        -- and applying your 1000x correction multiplier for low-price entries
+        -- 3. Side-by-side position changes per company, aggregating by normalized UPPER(cusip)
+        -- filtering for Common Stock and applying 1000x correction multiplier for low-price entries
         SELECT
-            hc.issuer_id,
+            hc.cusip,
             (hc.current_shares - hc.previous_shares) AS share_change,
             (hc.current_value - hc.previous_value) AS value_change,
             CASE WHEN hc.current_shares > hc.previous_shares THEN (hc.current_shares - hc.previous_shares) ELSE 0 END AS buying_shares,
@@ -4314,44 +4324,77 @@ def get_top_market_changes_today(
         JOIN PreviousFilings pf ON rf.filing_id = pf.current_filing_id
         LEFT JOIN LATERAL (
             SELECT
-                COALESCE(curr.issuer_id, prev.issuer_id) AS issuer_id,
-                COALESCE(curr.shares_or_principal_amount, 0) AS current_shares,
-                COALESCE(prev.shares_or_principal_amount, 0) AS previous_shares,
-                COALESCE(curr.value, 0) AS current_value,
-                COALESCE(prev.value, 0) AS previous_value
+                COALESCE(curr.cusip, prev.cusip) AS cusip,
+                COALESCE(curr.current_shares, 0) AS current_shares,
+                COALESCE(prev.previous_shares, 0) AS previous_shares,
+                COALESCE(curr.current_value, 0) AS current_value,
+                COALESCE(prev.previous_value, 0) AS previous_value
             FROM (
-                SELECT h.issuer_id, h.shares_or_principal_amount, 
-                       CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END as value 
+                SELECT 
+                    UPPER(i.cusip) AS cusip,
+                    SUM(h.shares_or_principal_amount) AS current_shares,
+                    SUM(CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END) AS current_value 
                 FROM holdings h
+                JOIN issuers i ON h.issuer_id = i.issuer_id
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.current_filing_id
                   AND tc.is_common_stock = TRUE
+                  AND i.cusip IS NOT NULL
+                GROUP BY UPPER(i.cusip)
             ) curr
             FULL OUTER JOIN (
-                SELECT h.issuer_id, h.shares_or_principal_amount, 
-                       CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END as value 
+                SELECT 
+                    UPPER(i.cusip) AS cusip,
+                    SUM(h.shares_or_principal_amount) AS previous_shares,
+                    SUM(CASE WHEN h.shares_or_principal_amount > 0 AND (h.value::numeric / h.shares_or_principal_amount) < 1.0 THEN h.value * 1000 ELSE h.value END) AS previous_value 
                 FROM holdings h
+                JOIN issuers i ON h.issuer_id = i.issuer_id
                 JOIN title_of_class_table tc ON h.title_of_class = tc.id
                 WHERE h.filing_id = pf.previous_filing_id
                   AND tc.is_common_stock = TRUE
-            ) prev ON curr.issuer_id = prev.issuer_id
+                  AND i.cusip IS NOT NULL
+                GROUP BY UPPER(i.cusip)
+            ) prev ON curr.cusip = prev.cusip
         ) hc ON TRUE
+    ),
+    TopMoverCusips AS (
+        -- 4. Roll up entries market-wide per normalized CUSIP to find the top 50
+        SELECT
+            hc.cusip,
+            SUM(hc.share_change) AS net_shares_change,
+            SUM(hc.value_change) AS net_value_change,
+            SUM(ABS(hc.value_change)) AS absolute_value_change,
+            SUM(hc.buying_shares) AS gross_buying_shares,
+            SUM(hc.selling_shares) AS gross_selling_shares
+        FROM HoldingsComparison hc
+        WHERE hc.cusip IS NOT NULL
+        GROUP BY hc.cusip
+        ORDER BY {order_by_inner} DESC
+        LIMIT 50
     )
-    -- 4. Roll up entries market-wide per stock issuer
+    -- 5. Attach canonical issuer metadata and primary US ticker for the top 50 stocks
     SELECT
-        i.issuer_name,
-        i.cusip,
-        i.symbol AS ticker,
-        SUM(hc.share_change) AS net_shares_change,
-        SUM(hc.value_change) AS net_value_change,
-        SUM(ABS(hc.value_change)) AS absolute_value_change,
-        SUM(hc.buying_shares) AS gross_buying_shares,
-        SUM(hc.selling_shares) AS gross_selling_shares
-    FROM HoldingsComparison hc
-    JOIN issuers i ON hc.issuer_id = i.issuer_id
-    GROUP BY i.issuer_id, i.issuer_name, i.cusip, i.symbol
-    ORDER BY {order_by_clause} DESC
-    LIMIT 50;
+        tm.cusip,
+        COALESCE(ci.issuer_name, tm.cusip) AS issuer_name,
+        ci.symbol AS ticker,
+        tm.net_shares_change,
+        tm.net_value_change,
+        tm.absolute_value_change,
+        tm.gross_buying_shares,
+        tm.gross_selling_shares
+    FROM TopMoverCusips tm
+    LEFT JOIN LATERAL (
+        SELECT i.issuer_name, i.symbol
+        FROM issuers i
+        WHERE i.cusip IN (tm.cusip, LOWER(tm.cusip))
+        ORDER BY 
+            (CASE WHEN i.symbol IS NOT NULL AND i.symbol NOT LIKE '%%.%%' THEN 1 
+                  WHEN i.symbol IS NOT NULL THEN 2 
+                  ELSE 3 END),
+            LENGTH(i.issuer_name) DESC
+        LIMIT 1
+    ) ci ON TRUE
+    ORDER BY {order_by_outer} DESC;
     """
 
     try:
@@ -4363,12 +4406,15 @@ def get_top_market_changes_today(
 
         stocks_data = []
         for row in results:
+            clean_cusip = row["cusip"].upper() if row["cusip"] else None
+            resolved_ticker = row["ticker"] or (
+                CUSIP_TO_TICKER.get(clean_cusip) if clean_cusip else None
+            )
             stocks_data.append(
                 TopStockChangeEntry(
                     issuer_name=row["issuer_name"],
-                    cusip=row["cusip"],
-                    # Fall back onto your JSON cross-map memory dictionary if DB ticker is null
-                    ticker=row["ticker"] or CUSIP_TO_TICKER.get(row["cusip"]),
+                    cusip=clean_cusip,
+                    ticker=resolved_ticker,
                     net_shares_change=float(row["net_shares_change"]),
                     net_value_change=float(row["net_value_change"]),
                     absolute_value_change=float(row["absolute_value_change"]),
