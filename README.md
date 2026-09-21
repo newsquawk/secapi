@@ -13,6 +13,7 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
   - [4. Filings & Detailed Holdings](#4-filings--detailed-holdings)
   - [5. Portfolio Comparison & Analysis](#5-portfolio-comparison--analysis)
   - [6. AI Summaries & Health Check](#6-ai-summaries--health-check)
+- [🧪 Running Tests](#-running-tests)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
 - [⚙️ Configuration](#️-configuration)
@@ -52,28 +53,31 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
   | :--- | :--- | :--- |
   | `cik` | string | CIK of the filing investment manager |
   | `company_name` | string | Manager / fund name |
-  | `aum` | integer \| null | Manager's assets under management |
+  | `aum` | integer \| null | Manager's assets under management (whole dollars) |
   | `latest_accession_number` | string | Accession number of the latest filing |
   | `previous_accession_number` | string \| null | Accession number of the previous filing |
   | `reporting_period` | date (`YYYY-MM-DD`) | Period of report of the latest filing |
   | `filing_date` | date (`YYYY-MM-DD`) | Date the latest filing was submitted |
+  | `form_type` | string \| null | **📌 Filing type** — e.g. `13F-HR` (initial) or `13F-HR/A` (amendment) |
   | `issuer_name` | string | **📌 Name** — underlying issuer name (e.g. `TESLA MOTORS`) |
   | `cusip` | string | CUSIP of the underlying security |
   | `ticker` | string \| null | **📌 Ticker** — resolved from CUSIP; `null` if unmapped |
-  | `is_common_stock` | boolean | Always `false` for the options feed |
+  | `is_common_stock` | boolean | Always `false` for options; `true` for common stock |
   | `put_or_call` | string \| null | **📌 Contract type** — `Put` / `Call` (or `PUT` / `CALL`) |
   | `change_type` | string | `new`, `closed`, `increased`, or `decreased` |
-  | `current_shares` | integer \| null | **📌 Shares** — contracts held in the latest filing |
-  | `previous_shares` | integer \| null | Contracts held in the previous filing |
+  | `current_shares` | integer \| null | **📌 Shares** — contracts or shares held in the latest filing |
+  | `previous_shares` | integer \| null | Contracts or shares held in the previous filing |
   | `change_in_share` | integer \| null | `current_shares - previous_shares` |
   | `percent_change` | float \| null | Percentage share change vs. previous filing (2 decimals) |
-  | `current_value` | integer \| null | **📌 Value** — current position value in thousands of $ |
-  | `previous_value` | integer \| null | Previous position value in thousands of $ |
-  | `absolute_value_change` | integer | `abs(current_value - previous_value)` in thousands of $ |
+  | `current_value` | integer \| null | **📌 Value** — current position value in **whole dollars ($)** |
+  | `previous_value` | integer \| null | Previous position value in **whole dollars ($)** |
+  | `absolute_value_change` | integer | `abs(current_value - previous_value)` in **whole dollars ($)** |
   | `current_price_per_share` | float \| null | `current_value / current_shares` (2 decimals) |
   | `previous_price_per_share` | float \| null | `previous_value / previous_shares` (2 decimals) |
+  | `weight_pct` | float \| null | **📌 Portfolio weight** — position's % of fund AUM (e.g. `5.4200` = 5.42%) |
+  | `value_pct` | float \| null | **📌 Value change** — % change in total position dollar value QoQ |
 
-> ⚠️ **Units**: All `*_value` fields (and the `min_value` filter) use the SEC 13F convention of **thousands of dollars** — e.g. `current_value: 2500000` = **$2.5 billion**, not $2.5M.
+> 💡 **Normalized Whole Dollars**: All `*_value` fields are standardized to **whole dollars** across all filings via `holdings_normalised`. Filings submitted to EDGAR before Jan 3, 2023 (originally submitted in $1,000s) are automatically scaled by 1,000, while filings on or after Jan 3, 2023 remain in whole dollars. This guarantees that `current_value / current_shares == current_price_per_share` directly without runtime heuristics, preserving accurate prices for penny stocks.
 
 * **Example**:
   ```bash
@@ -86,11 +90,12 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
       {
         "cik": "0001318605",
         "company_name": "Tesla Inc",
-        "aum": 123456789,
+        "aum": 123456789000,
         "latest_accession_number": "0001067983-25-000123",
         "previous_accession_number": "0001067983-25-000098",
         "reporting_period": "2025-06-30",
         "filing_date": "2025-08-14",
+        "form_type": "13F-HR",
         "issuer_name": "TESLA MOTORS",
         "cusip": "88160R101",
         "ticker": "TSLA",
@@ -101,11 +106,13 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
         "previous_shares": null,
         "change_in_share": 10000,
         "percent_change": null,
-        "current_value": 2500000,
+        "current_value": 2500000000,
         "previous_value": null,
-        "absolute_value_change": 2500000,
+        "absolute_value_change": 2500000000,
         "current_price_per_share": 250.0,
-        "previous_price_per_share": null
+        "previous_price_per_share": null,
+        "weight_pct": 2.025,
+        "value_pct": null
       }
     ],
     "has_next_page": false
@@ -113,7 +120,7 @@ Retrieves institutional Put and Call trades from the latest batch of 13F filings
   ```
 
 #### `GET /activity/latest/v3` — Common Stock Activity Stream
-Retrieves a flat list of individual Common Stock position changes across the latest batch of filings.
+Retrieves a flat list of individual Common Stock position changes across the latest batch of filings. Employs the exact same normalized `HoldingActivity` schema as options, including `weight_pct`, `value_pct`, and `form_type`.
 * **Query Parameters**:
   * `limit` *(int, default=3, 1-15)*: Number of company filings to fetch.
   * `offset` *(int, default=0)*: Number of company filings to skip.
@@ -226,13 +233,17 @@ Provides paginated, searchable, and sortable holdings data within a specific fil
 Compares two filings for a manager and returns a comprehensive breakdown of changes:
 * **Common Stock**: `new_holdings`, `closed_positions`, `increased_holdings`, `decreased_holdings`, `unchanged_holdings`.
 * **Other Securities / Options**: `new_other_securities`, `closed_other_securities`, `increased_other_securities`, `decreased_other_securities`, `unchanged_other_securities`.
+* **Response Envelope & Metadata**:
+  Includes top-level `metadata` object (`cik`, `company_name`, `ai_summary`, `latest_filing`, `previous_filing`, `amendment_used`) and:
+  * `truncated` *(boolean)*: `true` if either filing exceeded the 25,000-holding query safety limit (top 25k ordered by dollar value), alerting clients that only partial holdings are returned for mega-funds; `false` otherwise.
+* **HTTP Caching**: Employs deterministic SHA-256 ETags and `Cache-Control: public, max-age=86400, stale-while-revalidate=604800, immutable` for browser and proxy caching across restarts.
 * **Example**:
   ```bash
   curl "http://localhost:8000/analysis/0001067983-25-000098/0001067983-26-000012"
   ```
 
 #### `GET /company/{cik}/compare/latest` — Automatic Latest Comparison
-Convenience endpoint that automatically resolves and compares the two most recent filings for a given manager CIK.
+Convenience endpoint that automatically resolves and compares the two most recent filings for a given manager CIK. Employs the identical response schema, caching headers, and `truncated` metadata safety flag as `/analysis/...`.
 * **Example**: `curl "http://localhost:8000/company/0001067983/compare/latest"`
 
 ---
@@ -242,10 +253,29 @@ Convenience endpoint that automatically resolves and compares the two most recen
 #### `POST /api/ai_summary` — AI Portfolio Summary
 Accepts portfolio changes payload and generates an executive financial summary using DeepSeek LLM.
 * **Request Body**: `{"new_holdings": [...], "closed_positions": [...], "increased_holdings": [...], "decreased_holdings": [...]}`.
-* **Persistent Two-Tier Caching**: Results are deterministically hashed and stored in PostgreSQL (`ai_summaries`) and an in-memory LRU cache. Repeated requests return in **<10ms** across all server workers without re-calling the LLM.
+* **Persistent Two-Tier Caching**: Results are deterministically hashed and stored in PostgreSQL (`ai_summaries`) and an in-memory LRU cache with auto-eviction (`popitem`). Repeated requests return in **<10ms** across all server workers without re-calling the LLM.
 
 #### `GET /health` — Liveness Probe
 Returns `{"status": "ok"}`. Used by load balancers and container health checks.
+
+---
+
+## 🧪 Running Tests
+
+The test suite validates data normalization accuracy against historical stock market closing prices and guards against output regressions:
+
+```bash
+# Run all unit and regression tests
+./env/bin/python -m unittest discover tests -v
+```
+
+### Test Suites:
+1. **Value Normalization Accuracy (`tests/test_value_normalization_accuracy.py`)**:
+   - Cross-checks Apple (AAPL, CUSIP `037833100`) implied share prices against NYSE closing prices across 2022 and 2023.
+   - Verifies portfolio AUM stability (`AUM / SUM(normalised_value) ≈ 1.0`).
+   - Verifies that post-2023 sub-$1 penny stocks (e.g. $0.44/share) are preserved in whole dollars and not inflated.
+2. **Characterization Regression (`tests/test_characterization.py`)**:
+   - Verifies live query outputs against baseline snapshots (`tests/snapshots/baseline_current.json`) across 4 test cohorts (Pre-2023, Penny Stocks, Post-2023 Standard, Options) to guarantee zero unwanted output drift.
 
 ---
 
