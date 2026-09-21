@@ -1266,6 +1266,8 @@ async def openai_call(
                 summary_text = cached_row["summary"]
                 logger.info(f"Serving AI summary for {cache_key[:8]} from database cache")
                 AI_SUMMARY_CACHE[cache_key] = summary_text
+                if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
+                    AI_SUMMARY_CACHE.popitem(last=False)
                 return JSONResponse(
                     content={"summary": summary_text},
                     headers={"Cache-Control": "public, max-age=86400, immutable"},
@@ -1386,7 +1388,7 @@ HOLDINGS_QUERY = """
         p.name AS put_or_call,
         i.cusip,
         i.sic
-    FROM holdings h
+    FROM holdings_normalised h
     LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
     LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
     LEFT JOIN put_or_call_table p ON h.put_or_call = p.id
@@ -1498,7 +1500,7 @@ def compare_holdings(
             COMPARE_CACHE.move_to_end(cache_key)
             if response:
                 response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800, immutable"
-                response.headers["ETag"] = f'"{hash(cache_key)}"'
+                response.headers["ETag"] = f'"{hashlib.sha256(cache_key.encode()).hexdigest()[:16]}"'
             return COMPARE_CACHE[cache_key]
 
         # Get filing details for the previous and latest filings
@@ -1920,10 +1922,15 @@ def compare_holdings(
             return data_list
 
         # Prepare response data
+        is_truncated = bool(
+            (previous_holdings_data and len(previous_holdings_data) >= 25000)
+            or (latest_holdings_data and len(latest_holdings_data) >= 25000)
+        )
         response_data = {
             "metadata": {
                 "cik": latest_filing.get("cik_number"),
                 "company_name": latest_filing.get("company_name"),
+                "truncated": is_truncated,
                 "ai_summary": "Not Available",
                 "amendment_used": amendment_used,
                 "latest_filing": {
@@ -2037,7 +2044,7 @@ def compare_holdings(
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800, immutable"
-            response.headers["ETag"] = f'"{hash(cache_key)}"'
+            response.headers["ETag"] = f'"{hashlib.sha256(cache_key.encode()).hexdigest()[:16]}"'
 
         return response_data
 
@@ -2331,7 +2338,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares,
             tc.is_common_stock
-        FROM holdings h
+        FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
@@ -2349,17 +2356,9 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,
                 COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
-                CASE
-                    WHEN curr.total_shares > 0 AND COALESCE(curr.is_common_stock, prev.is_common_stock) AND (curr.total_value::numeric / curr.total_shares) < 1.0
-                    THEN curr.total_value * 1000
-                    ELSE curr.total_value
-                END AS current_value,
+                curr.total_value AS current_value,
                 curr.total_shares AS current_shares,
-                CASE
-                    WHEN prev.total_shares > 0 AND COALESCE(curr.is_common_stock, prev.is_common_stock) AND (prev.total_value::numeric / prev.total_shares) < 1.0
-                    THEN prev.total_value * 1000
-                    ELSE prev.total_value
-                END AS previous_value,
+                prev.total_value AS previous_value,
                 prev.total_shares AS previous_shares,
                 (curr.total_shares - prev.total_shares) AS change_in_share,
                 CASE
@@ -2412,10 +2411,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_new_shares,
         MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_value END) AS top_new_value,
         MAX(CASE WHEN rc.change_type = 'new' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_new_price,
         -- Common Stock - Closed
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_issuer,
@@ -2423,10 +2419,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_shares,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_value,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
-            CASE
-                WHEN (rc.previous_value::numeric / rc.previous_shares) < 1.0 THEN (rc.previous_value::numeric * 1000) / rc.previous_shares
-                ELSE (rc.previous_value::numeric) / rc.previous_shares
-            END
+            (rc.previous_value::numeric) / rc.previous_shares
         ELSE 0 END) AS top_closed_price,
         -- Common Stock - Increased
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_issuer,
@@ -2435,10 +2428,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_change_in_share,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_percent_change,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_increased_price,
         -- Common Stock - Decreased
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_issuer,
@@ -2447,10 +2437,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_change_in_share,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_percent_change,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_decreased_price,
         -- Other Securities - New
         MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_new_other_issuer,
@@ -2458,10 +2445,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_new_other_shares,
         MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_value END) AS top_new_other_value,
         MAX(CASE WHEN rc.change_type = 'new' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_new_other_price,  
         -- Other Securities - Closed
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_other_issuer,
@@ -2469,10 +2453,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_other_shares,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_other_value,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
-            CASE
-                WHEN (rc.previous_value::numeric / rc.previous_shares) < 1.0 THEN (rc.previous_value::numeric * 1000) / rc.previous_shares
-                ELSE (rc.previous_value::numeric) / rc.previous_shares
-            END
+            (rc.previous_value::numeric) / rc.previous_shares
         ELSE 0 END) AS top_closed_other_price,
         -- Other Securities - Increased
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_other_issuer,
@@ -2481,10 +2462,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_other_change_in_share,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_other_percent_change,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_increased_other_price,
         -- Other Securities - Decreased
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_other_issuer,
@@ -2493,10 +2471,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_other_change_in_share,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_other_percent_change,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
-            CASE
-                WHEN (rc.current_value::numeric / rc.current_shares) < 1.0 THEN (rc.current_value::numeric * 1000) / rc.current_shares
-                ELSE (rc.current_value::numeric) / rc.current_shares
-            END
+            (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_decreased_other_price
     FROM
         FilingsWithPrevious fwp
@@ -2791,7 +2766,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares,
             tc.is_common_stock
-        FROM holdings h
+        FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
@@ -2810,6 +2785,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
+            (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
             hc.cusip,
             hc.issuer_name,
             hc.current_value,
@@ -2860,6 +2836,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
         hc.previous_accession_number,
         hc.period_of_report AS reporting_period,
         hc.filing_date,
+        hc.form_type,
         hc.issuer_name,
         hc.cusip,
         hc.is_common_stock,
@@ -2874,32 +2851,30 @@ LATEST_ACTIVITY_QUERY_V3 = """
         hc.aum,
         ROUND(
             CASE
-                WHEN hc.current_shares > 0 THEN
-                    CASE
-                        -- Only apply 1000x logic IF it is common stock AND price is < 1.0
-                        WHEN hc.is_common_stock AND (hc.current_value::numeric / hc.current_shares) < 1.0 
-                        THEN (hc.current_value::numeric * 1000) / hc.current_shares
-                        
-                        -- Otherwise (not common stock OR price is >= 1.0), calculate normally
-                        ELSE (hc.current_value::numeric) / hc.current_shares
-                    END
+                WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares
                 ELSE 0
             END, 2
         ) AS current_price_per_share,
         ROUND(
             CASE
-                WHEN hc.previous_shares > 0 THEN
-                    CASE
-                        -- Only apply 1000x logic IF it is common stock AND price is < 1.0
-                        WHEN hc.is_common_stock AND (hc.previous_value::numeric / hc.previous_shares) < 1.0 
-                        THEN (hc.previous_value::numeric * 1000) / hc.previous_shares
-                        
-                        -- Otherwise (not common stock OR price is >= 1.0), calculate normally
-                        ELSE (hc.previous_value::numeric) / hc.previous_shares
-                    END
+                WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares
                 ELSE 0
             END, 2
-        ) AS previous_price_per_share
+        ) AS previous_price_per_share,
+        ROUND(
+            CASE
+                WHEN hc.aum > 0 AND hc.current_value > 0 THEN
+                    (hc.current_value::numeric / hc.aum) * 100
+                ELSE NULL
+            END, 4
+        ) AS weight_pct,
+        ROUND(
+            CASE
+                WHEN hc.previous_value > 0 AND hc.current_value IS NOT NULL THEN
+                    ((hc.current_value::numeric - hc.previous_value::numeric) / hc.previous_value::numeric) * 100
+                ELSE NULL
+            END, 2
+        ) AS value_pct
     FROM
         HoldingsComparison hc
     WHERE
@@ -3054,7 +3029,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares
-        FROM holdings h
+        FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN put_or_call_table p ON h.put_or_call = p.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
@@ -3073,6 +3048,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
+            (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
             hc.cusip,
             hc.put_or_call,
             hc.issuer_name,
@@ -3124,6 +3100,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         hc.previous_accession_number,
         hc.period_of_report AS reporting_period,
         hc.filing_date,
+        hc.form_type,
         hc.issuer_name,
         hc.cusip,
         hc.put_or_call,
@@ -3138,7 +3115,21 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
         ROUND(CASE WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares ELSE 0 END, 2) AS current_price_per_share,
-        ROUND(CASE WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares ELSE 0 END, 2) AS previous_price_per_share
+        ROUND(CASE WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares ELSE 0 END, 2) AS previous_price_per_share,
+        ROUND(
+            CASE
+                WHEN hc.aum > 0 AND hc.current_value > 0 THEN
+                    (hc.current_value::numeric / hc.aum) * 100
+                ELSE NULL
+            END, 4
+        ) AS weight_pct,
+        ROUND(
+            CASE
+                WHEN hc.previous_value > 0 AND hc.current_value IS NOT NULL THEN
+                    ((hc.current_value::numeric - hc.previous_value::numeric) / hc.previous_value::numeric) * 100
+                ELSE NULL
+            END, 2
+        ) AS value_pct
     FROM
         HoldingsComparison hc
     WHERE

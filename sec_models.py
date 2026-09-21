@@ -71,6 +71,11 @@ class HoldingActivity(BaseModel):
     current_price_per_share: Optional[float] = None
     previous_price_per_share: Optional[float] = None
 
+    # Downstream Facet Info (content-hub)
+    weight_pct: Optional[float] = None
+    value_pct: Optional[float] = None
+    form_type: Optional[str] = None
+
 
 class HoldingsRequest(BaseModel):
     new_holdings: List[Dict[str, Any]]
