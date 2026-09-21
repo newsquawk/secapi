@@ -149,6 +149,37 @@ class TestLegacyResponseModels(unittest.TestCase):
         self.assertEqual(res.pagination.limit, 2)
         self.assertEqual(res.pagination.offset, 0)
 
+    def test_filings_aum_filtering(self):
+        r = self.client.get("/filings?min_aum=100000000&limit=5")
+        self.assertEqual(r.status_code, 200)
+        res = FilingsListResponse(**r.json())
+        self.assertIsInstance(res.filings, list)
+        self.assertGreater(len(res.filings), 0)
+        for filing in res.filings:
+            self.assertGreaterEqual(filing.aum, 100000000)
+
+    def test_managers_aum_filtering(self):
+        r = self.client.get("/managers?min_aum=100000000&limit=5")
+        self.assertEqual(r.status_code, 200)
+        items = [ManagerSummary(**item) for item in r.json()]
+        self.assertGreater(len(items), 0)
+        for item in items:
+            self.assertTrue(item.cik)
+            self.assertTrue(item.company_name)
+
+    def test_activity_v3_options_dispatch(self):
+        r = self.client.get("/activity/latest/v3?security_type=options&limit=2")
+        self.assertEqual(r.status_code, 200)
+        res = LatestActivityResponse(**r.json())
+        self.assertIsNotNone(res.pagination)
+        self.assertEqual(res.pagination.limit, 2)
+
+    def test_activity_v3_invalid_security_type(self):
+        r = self.client.get("/activity/latest/v3?security_type=cryptocurrency")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Invalid security_type", r.json().get("detail", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
+

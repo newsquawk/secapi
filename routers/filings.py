@@ -70,6 +70,222 @@ def _format_holdings_text(d: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared Query Engines
+# ---------------------------------------------------------------------------
+def _query_companies(
+    db: psycopg2.extensions.cursor,
+    limit: int = 100,
+    offset: int = 0,
+    min_aum: Optional[int] = None,
+    max_aum: Optional[int] = None,
+):
+    """
+    Shared company query engine.
+    Fetches companies with address formatting, AUM ranking, and pagination metadata.
+    """
+    where_clauses = ["1=1"]
+    params = []
+
+    if min_aum is not None:
+        where_clauses.append("aum >= %s")
+        params.append(min_aum)
+    if max_aum is not None:
+        where_clauses.append("aum <= %s")
+        params.append(max_aum)
+
+    where_sql = " AND ".join(where_clauses)
+
+    count_query = f"SELECT count(*) AS total FROM companies WHERE {where_sql}"
+    db.execute(count_query, tuple(params))
+    total_row = db.fetchone()
+
+    order_clause = (
+        "aum DESC NULLS LAST, company_name ASC"
+        if (min_aum is not None or max_aum is not None)
+        else "cik_number ASC"
+    )
+    query = f"""
+        SELECT 
+            cik_number,
+            company_name, 
+            company_phone,
+            company_mail_street1,
+            company_mail_street2,
+            company_mail_city,
+            company_mail_state,
+            company_mail_state_desc,
+            company_zipcode,
+            company_business_street1,
+            company_business_street2,
+            company_business_city,
+            company_business_state,
+            company_business_state_desc,
+            company_business_zipcode,
+            aum
+        FROM companies
+        WHERE {where_sql}
+        ORDER BY {order_clause}
+        LIMIT %s OFFSET %s
+    """
+    db.execute(query, tuple(params + [limit, offset]))
+    results = db.fetchall()
+
+    total_count = total_row["total"] if total_row else len(results)
+    has_more = (offset + len(results)) < total_count
+    next_offset = offset + limit if has_more else None
+
+    return results, total_count, has_more, next_offset
+
+
+def _query_filings(
+    db: psycopg2.extensions.cursor,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: str = "filing_date",
+    sort_order: str = "desc",
+    min_aum: Optional[int] = None,
+    max_aum: Optional[int] = None,
+    ciks: Optional[List[str]] = None,
+    company_id: Optional[int] = None,
+):
+    """
+    Shared filings query engine.
+    Fetches filings with company metadata, AUM, and pagination metadata.
+    """
+    allowed_sort_columns = {
+        "company_name": "c.company_name",
+        "cik_number": "c.cik_number",
+        "form_type": "f.form_type",
+        "accession_number": "f.accession_number",
+        "filing_date": "f.filing_date",
+        "period_of_report": "f.period_of_report",
+        "created_at": "f.created_at",
+        "aum": "c.aum",
+    }
+
+    if sort_by not in allowed_sort_columns:
+        logger.error(f"Invalid sort column specified: {sort_by}")
+        raise HTTPException(status_code=400, detail="Invalid sort column specified.")
+
+    if sort_order.lower() not in ["asc", "desc"]:
+        logger.error(f"Invalid sort order specified: {sort_order}")
+        raise HTTPException(status_code=400, detail="Invalid sort order. Use 'asc' or 'desc'.")
+
+    sort_column = allowed_sort_columns[sort_by]
+    sort_order_str = sort_order.upper()
+
+    where_clauses = ["1=1"]
+    params = {}
+
+    if company_id is not None:
+        where_clauses.append("f.company_id = %(company_id)s")
+        params["company_id"] = company_id
+
+    if min_aum is not None:
+        where_clauses.append("c.aum >= %(min_aum)s")
+        params["min_aum"] = min_aum
+
+    if max_aum is not None:
+        where_clauses.append("c.aum <= %(max_aum)s")
+        params["max_aum"] = max_aum
+
+    if ciks:
+        clean_ciks = [c.strip().lstrip("0") or "0" for c in ciks if c.strip()]
+        all_ciks = list(set(ciks + clean_ciks))
+        where_clauses.append("c.cik_number = ANY(%(ciks)s)")
+        params["ciks"] = all_ciks
+
+    has_filters = bool(company_id is not None or min_aum is not None or max_aum is not None or ciks)
+    where_sql = " AND ".join(where_clauses)
+
+    if sort_by == "aum" and not has_filters:
+        count_query = """
+            SELECT COUNT(*) as count 
+            FROM companies c 
+            WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
+        """
+        db.execute(count_query)
+        total_count = db.fetchone()["count"]
+
+        filings_query = f"""
+            SELECT
+                lf.accession_number, lf.form_type, lf.filing_date, lf.period_of_report,
+                lf.file_number, lf.filing_directory, lf.created_at, lf.updated_at,
+                c.company_name, c.cik_number, c.aum
+            FROM (
+                SELECT company_id, company_name, cik_number, aum
+                FROM companies c
+                WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
+                ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST, company_name ASC
+                LIMIT %(limit)s OFFSET %(offset)s
+            ) c
+            CROSS JOIN LATERAL (
+                SELECT f.accession_number, f.form_type, f.filing_date, f.period_of_report,
+                       f.file_number, f.filing_directory, f.created_at, f.updated_at
+                FROM filings f
+                WHERE f.company_id = c.company_id
+                ORDER BY f.filing_date DESC, f.accession_number DESC
+                LIMIT 1
+            ) lf
+        """
+        params["limit"] = limit
+        params["offset"] = offset
+        db.execute(filings_query, params)
+        filings_data = db.fetchall()
+    else:
+        if not has_filters:
+            count_query = "SELECT COALESCE(NULLIF(reltuples::bigint, 0), (SELECT count(*) FROM filings)) AS count FROM pg_class WHERE relname = 'filings'"
+            db.execute(count_query)
+            total_count = db.fetchone()["count"]
+        else:
+            count_query = f"""
+                SELECT count(*) AS count
+                FROM filings f
+                JOIN companies c ON f.company_id = c.company_id
+                WHERE {where_sql}
+            """
+            db.execute(count_query, params)
+            total_count = db.fetchone()["count"]
+
+        if total_count == 0:
+            return [], 0, False, None
+
+        order_by_clause = f"{sort_column} {sort_order_str}"
+        if sort_by == "filing_date":
+            order_by_clause += f", f.created_at {sort_order_str}"
+        elif sort_by != "created_at":
+            order_by_clause += ", f.filing_date DESC, f.created_at DESC"
+
+        filings_query = f"""
+            SELECT
+                f.accession_number,
+                f.form_type,
+                f.filing_date,
+                f.period_of_report,
+                f.file_number,
+                f.filing_directory,
+                f.created_at,
+                f.updated_at,
+                c.company_name,
+                c.cik_number,
+                c.aum
+            FROM filings f
+            LEFT JOIN companies c ON f.company_id = c.company_id
+            WHERE {where_sql}
+            ORDER BY {order_by_clause}
+            LIMIT %(limit)s OFFSET %(offset)s
+        """
+        params["limit"] = limit
+        params["offset"] = offset
+        db.execute(filings_query, params)
+        filings_data = db.fetchall()
+
+    has_more = (offset + len(filings_data)) < total_count
+    next_offset = offset + limit if has_more else None
+    return filings_data, total_count, has_more, next_offset
+
+
+# ---------------------------------------------------------------------------
 # Managers Endpoints
 # ---------------------------------------------------------------------------
 @router.get(
@@ -88,34 +304,16 @@ def get_managers(
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    min_aum: Optional[int] = Query(None, description="Minimum AUM filter"),
+    max_aum: Optional[int] = Query(None, description="Maximum AUM filter"),
     envelope: bool = Query(
         False, description="Envelope response with pagination metadata"
     ),
 ):
-    """Retrieve all managers with pagination."""
-    query = """
-        SELECT 
-            cik_number,
-            company_name, 
-            company_phone,
-            company_mail_street1,
-            company_mail_street2,
-            company_mail_city,
-            company_mail_state,
-            company_mail_state_desc,
-            company_zipcode,
-            company_business_street1,
-            company_business_street2,
-            company_business_city,
-            company_business_state,
-            company_business_state_desc,
-            company_business_zipcode
-        FROM companies
-        LIMIT %s OFFSET %s
-    """
-    logger.info(f"Executing query to fetch managers with limit={limit} and offset={offset}")
-    db.execute(query, (limit, offset))
-    results = db.fetchall()
+    """Retrieve all managers with pagination and optional AUM filtering."""
+    results, total_managers, has_more, next_offset = _query_companies(
+        db, limit=limit, offset=offset, min_aum=min_aum, max_aum=max_aum
+    )
 
     companies = []
     for row in results:
@@ -147,12 +345,6 @@ def get_managers(
         )
 
     logger.info(f"Fetched {len(companies)} managers from the database.")
-
-    db.execute("SELECT count(*) AS total FROM companies")
-    total_row = db.fetchone()
-    total_managers = total_row["total"] if total_row else len(companies)
-    has_more = (offset + len(companies)) < total_managers
-    next_offset = offset + limit if has_more else None
 
     if response:
         response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
@@ -276,53 +468,16 @@ def get_manager_filings(
             raise HTTPException(status_code=404, detail=f"Manager with CIK {cik} not found")
         company_id = company["company_id"]  # type: ignore
 
-        count_query = "SELECT COUNT(*) FROM filings WHERE company_id = %s"
-        db.execute(count_query, (company_id,))
-        total_count = db.fetchone()["count"]  # type: ignore
-
-        if total_count == 0:
-            logger.info(f"No filings found for manager with CIK={cik}")
-            if response:
-                response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-                response.headers["X-Total-Count"] = "0"
-                response.headers["X-Has-More"] = "false"
-                response.headers["X-Limit"] = str(limit)
-                response.headers["X-Offset"] = str(offset)
-            return {
-                "filings": [],
-                "pagination": {
-                    "limit": limit,
-                    "offset": offset,
-                    "total": 0,
-                    "has_more": False,
-                    "next_offset": None,
-                },
-            }
-
-        filings_query = """
-            SELECT
-                accession_number,
-                form_type,
-                filing_date,
-                period_of_report,
-                file_number,
-                filing_directory,
-                created_at,
-                updated_at
-            FROM filings
-            WHERE company_id = %s
-            ORDER BY filing_date DESC
-            LIMIT %s OFFSET %s
-        """
-        logger.info(
-            f"Executing filings query for company_id={company_id} with limit={limit} and offset={offset}"
+        filings_data, total_count, has_more, next_offset = _query_filings(
+            db,
+            limit=limit,
+            offset=offset,
+            sort_by="filing_date",
+            sort_order="desc",
+            company_id=company_id,
         )
-        db.execute(filings_query, (company_id, limit, offset))
-        filings_data = db.fetchall()
 
-        filings = [Filing(**row) for row in filings_data]  # type: ignore
-        has_more = (offset + len(filings)) < total_count
-        next_offset = offset + limit if has_more else None
+        filings = [Filing(**row) for row in filings_data]
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
@@ -361,123 +516,24 @@ def get_filings(
     offset: int = Query(0, description="Number of items to skip", ge=0),
     sort_by: str = Query("filing_date", description="Column to sort by"),
     sort_order: str = Query("desc", description="Sort order: 'asc' or 'desc'"),
+    min_aum: Optional[int] = Query(None, description="Minimum AUM filter"),
+    max_aum: Optional[int] = Query(None, description="Maximum AUM filter"),
+    ciks: Optional[List[str]] = Query(None, description="List of company CIKs to include"),
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """Retrieve filings with sorting and pagination metadata."""
-    allowed_sort_columns = {
-        "company_name": "c.company_name",
-        "cik_number": "c.cik_number",
-        "form_type": "f.form_type",
-        "accession_number": "f.accession_number",
-        "filing_date": "f.filing_date",
-        "period_of_report": "f.period_of_report",
-        "created_at": "f.created_at",
-        "aum": "c.aum",
-    }
-
-    if sort_by not in allowed_sort_columns:
-        logger.error(f"Invalid sort column specified: {sort_by}")
-        raise HTTPException(status_code=400, detail="Invalid sort column specified.")
-
-    if sort_order.lower() not in ["asc", "desc"]:
-        logger.error(f"Invalid sort order specified: {sort_order}")
-        raise HTTPException(status_code=400, detail="Invalid sort order. Use 'asc' or 'desc'.")
-
-    sort_column = allowed_sort_columns[sort_by]
-    sort_order_str = sort_order.upper()
-
     try:
-        if sort_by == "aum":
-            count_query = """
-                SELECT COUNT(*) as count 
-                FROM companies c 
-                WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
-            """
-            db.execute(count_query)
-            total_count = db.fetchone()["count"]
-
-            filings_query = f"""
-                SELECT
-                    lf.accession_number, lf.form_type, lf.filing_date, lf.period_of_report,
-                    lf.file_number, lf.filing_directory, lf.created_at, lf.updated_at,
-                    c.company_name, c.cik_number, c.aum
-                FROM (
-                    SELECT company_id, company_name, cik_number, aum
-                    FROM companies c
-                    WHERE EXISTS (SELECT 1 FROM filings f WHERE f.company_id = c.company_id)
-                    ORDER BY NULLIF(aum, 0) {sort_order_str} NULLS LAST, company_name ASC
-                    LIMIT %s OFFSET %s
-                ) c
-                CROSS JOIN LATERAL (
-                    SELECT f.accession_number, f.form_type, f.filing_date, f.period_of_report,
-                           f.file_number, f.filing_directory, f.created_at, f.updated_at
-                    FROM filings f
-                    WHERE f.company_id = c.company_id
-                    ORDER BY f.filing_date DESC, f.accession_number DESC
-                    LIMIT 1
-                ) lf
-            """
-            logger.info(f"Executing filings query with AUM sorting, limit={limit}, offset={offset}")
-            db.execute(filings_query, (limit, offset))
-            filings_data = db.fetchall()
-        else:
-            count_query = "SELECT COALESCE(NULLIF(reltuples::bigint, 0), (SELECT count(*) FROM filings)) AS count FROM pg_class WHERE relname = 'filings'"
-            db.execute(count_query)
-            total_count = db.fetchone()["count"]  # type: ignore
-
-            order_by_clause = f"{sort_column} {sort_order_str}"
-            if sort_by == "filing_date":
-                order_by_clause += f", f.created_at {sort_order_str}"
-            else:
-                order_by_clause += ", f.filing_date DESC, f.created_at DESC"
-
-            if total_count == 0:
-                logger.info("No filings found in the database.")
-                if response:
-                    response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-                    response.headers["X-Total-Count"] = "0"
-                    response.headers["X-Has-More"] = "false"
-                    response.headers["X-Limit"] = str(limit)
-                    response.headers["X-Offset"] = str(offset)
-                return {
-                    "filings": [],
-                    "pagination": {
-                        "limit": limit,
-                        "offset": offset,
-                        "total": 0,
-                        "has_more": False,
-                        "next_offset": None,
-                    },
-                    "sorting": {
-                        "current_sort_by": sort_by,
-                        "current_sort_order": sort_order,
-                    },
-                }
-
-            filings_query = f"""
-                SELECT
-                    f.accession_number,
-                    f.form_type,
-                    f.filing_date,
-                    f.period_of_report,
-                    f.file_number,
-                    f.filing_directory,
-                    f.created_at,
-                    f.updated_at,
-                    c.company_name,
-                    c.cik_number
-                FROM filings f
-                LEFT JOIN companies c ON f.company_id = c.company_id
-                ORDER BY {order_by_clause}
-                LIMIT %s OFFSET %s
-            """
-            logger.info(f"Executing filings query with limit={limit} and offset={offset}")
-            db.execute(filings_query, (limit, offset))
-            filings_data = db.fetchall()
-
-        has_more = (offset + len(filings_data)) < total_count
-        next_offset = offset + limit if has_more else None
+        filings_data, total_count, has_more, next_offset = _query_filings(
+            db,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            min_aum=min_aum,
+            max_aum=max_aum,
+            ciks=ciks,
+        )
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
@@ -779,43 +835,10 @@ def search_companies_by_aum(
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
-    """Search for companies within a specific Assets Under Management (AUM) range."""
-    count_query = "SELECT count(*) AS total FROM companies WHERE 1=1"
-    count_params = []
-    if min_aum is not None:
-        count_query += " AND aum >= %s"
-        count_params.append(min_aum)
-    if max_aum is not None:
-        count_query += " AND aum <= %s"
-        count_params.append(max_aum)
-
-    query = """
-        SELECT
-            cik_number,
-            company_name,
-            aum
-        FROM companies
-        WHERE 1=1
-    """
-    params = []
-
-    if min_aum is not None:
-        query += " AND aum >= %s"
-        params.append(min_aum)
-
-    if max_aum is not None:
-        query += " AND aum <= %s"
-        params.append(max_aum)
-
-    query += " ORDER BY aum DESC NULLS LAST LIMIT %s OFFSET %s"
-    params.extend([limit, offset])
-
     try:
-        db.execute(count_query, tuple(count_params))
-        total_row = db.fetchone()
-
-        db.execute(query, tuple(params))
-        results = db.fetchall()
+        results, total_count, has_more, next_offset = _query_companies(
+            db, limit=limit, offset=offset, min_aum=min_aum, max_aum=max_aum
+        )
 
         companies = [
             {
@@ -825,10 +848,6 @@ def search_companies_by_aum(
             }
             for row in results
         ]
-
-        total_count = total_row["total"] if total_row else len(companies)
-        has_more = (offset + len(companies)) < total_count
-        next_offset = offset + limit if has_more else None
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
@@ -874,90 +893,17 @@ def search_filings_by_aum(
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
-    """Search and filter filings based on Company AUM and specific CIKs with pagination and sorting."""
-    allowed_sort_columns = {
-        "filing_date": "f.filing_date",
-        "created_at": "f.created_at",
-        "period_of_report": "f.period_of_report",
-    }
-
-    if sort_by not in allowed_sort_columns:
-        logger.error(f"Invalid sort column specified: {sort_by}")
-        raise HTTPException(status_code=400, detail="Invalid sort column specified.")
-
-    if sort_order.lower() not in ["asc", "desc"]:
-        logger.error(f"Invalid sort order specified: {sort_order}")
-        raise HTTPException(status_code=400, detail="Invalid sort order. Use 'asc' or 'desc'.")
-
-    sort_column = allowed_sort_columns[sort_by]
-    sort_dir = sort_order.upper()
-
     try:
-        where_clauses = ["1=1"]
-        params = {}
-
-        if min_aum is not None:
-            where_clauses.append("c.aum >= %(min_aum)s")
-            params["min_aum"] = min_aum
-
-        if max_aum is not None:
-            where_clauses.append("c.aum <= %(max_aum)s")
-            params["max_aum"] = max_aum
-
-        if ciks:
-            clean_ciks = [c.strip().lstrip("0") or "0" for c in ciks if c.strip()]
-            all_ciks = list(set(ciks + clean_ciks))
-            where_clauses.append("c.cik_number = ANY(%(ciks)s)")
-            params["ciks"] = all_ciks
-
-        where_sql = " AND ".join(where_clauses)
-
-        count_query = f"""
-            SELECT count(*)
-            FROM filings f
-            JOIN companies c ON f.company_id = c.company_id
-            WHERE {where_sql}
-        """
-        db.execute(count_query, params)
-        total_count = db.fetchone()["count"]
-
-        if total_count == 0:
-            if response:
-                response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
-                response.headers["X-Total-Count"] = "0"
-                response.headers["X-Has-More"] = "false"
-                response.headers["X-Limit"] = str(limit)
-                response.headers["X-Offset"] = str(offset)
-            return {
-                "filings": [],
-                "pagination": {
-                    "limit": limit,
-                    "offset": offset,
-                    "total": 0,
-                    "has_more": False,
-                    "next_offset": None,
-                },
-            }
-
-        filings_query = f"""
-            SELECT
-                f.accession_number, f.form_type, f.filing_date, f.period_of_report,
-                f.file_number, f.filing_directory, f.created_at, f.updated_at,
-                c.company_name, c.cik_number, c.aum
-            FROM filings f
-            JOIN companies c ON f.company_id = c.company_id
-            WHERE {where_sql}
-            ORDER BY {sort_column} {sort_dir}
-            LIMIT %(limit)s OFFSET %(offset)s
-        """
-        params["limit"] = limit
-        params["offset"] = offset
-
-        db.execute(filings_query, params)
-        filings_data = db.fetchall()
-
-        has_more = (offset + len(filings_data)) < total_count
-        next_offset = offset + limit if has_more else None
+        filings_data, total_count, has_more, next_offset = _query_filings(
+            db,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            min_aum=min_aum,
+            max_aum=max_aum,
+            ciks=ciks,
+        )
 
         if response:
             response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
