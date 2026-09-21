@@ -18,6 +18,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile and validate Python syntax
+        run: |
+          python -m py_compile main.py sec_models.py scripts/characterize_outputs.py scripts/deduplicate_issuers.py
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -90,5 +99,28 @@ jobs:
               -e CORS_ORIGINS=https://app.newsquawk.com,http://159.203.94.47:5000 \
               $IMAGE_NAME
             
-            # 5. Clean up old unused images
+            # 5. Health Check Gate (Wait for container readiness)
+            echo "Waiting for container readiness..."
+            HEALTHY=false
+            for i in $(seq 1 15); do
+              if curl -sf http://localhost:8000/health > /dev/null; then
+                echo "Health check passed on attempt $i!"
+                HEALTHY=true
+                break
+              fi
+              echo "Waiting for /health ($i/15)..."
+              sleep 2
+            done
+
+            if [ "$HEALTHY" = false ]; then
+              echo "Health check failed after 30 seconds!"
+              docker logs --tail 50 secapi_container
+              exit 1
+            fi
+
+            # 6. Run automated test suite inside container against database
+            echo "Running automated test suite inside container..."
+            docker exec secapi_container python -m unittest discover tests -v
+
+            # 7. Clean up old unused images
             docker image prune -f
