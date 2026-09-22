@@ -97,6 +97,7 @@ jobs:
               -e DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY \
               -e DB_NAME=sec \
               -e CORS_ORIGINS=https://app.newsquawk.com,http://159.203.94.47:5000 \
+              -e ENABLE_DOCS=true \
               $IMAGE_NAME
             
             # 5. Health Check Gate (Wait for container readiness)
