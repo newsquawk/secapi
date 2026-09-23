@@ -179,6 +179,20 @@ class TestLegacyResponseModels(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("Invalid security_type", r.json().get("detail", ""))
 
+    def test_get_holding_by_accession_number(self):
+        # Test endpoint /holdings/{accession_number}
+        r = self.client.get("/holdings/0001011443-25-000038?length=5")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertIn("recordsTotal", data)
+        self.assertIn("data", data)
+        self.assertGreater(data["recordsTotal"], 0)
+        if data["data"]:
+            first = data["data"][0]
+            self.assertIn("cusip", first)
+            self.assertIn("shares_or_principal_type", first)
+            self.assertIn(first["shares_or_principal_type"], ("SH", "PRN"))
+
 
 if __name__ == "__main__":
     unittest.main()

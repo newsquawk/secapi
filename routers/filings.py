@@ -683,7 +683,7 @@ def get_holding_by_accession_number(
             FROM holdings_normalised h
             LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
             LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
-            LEFT JOIN ssh_prnamt_type_table s ON h.shares_or_principal_type = s.id
+            LEFT JOIN share_type_table s ON h.shares_or_principal_type = s.id
             LEFT JOIN put_or_call_table p ON h.put_or_call = p.id
             LEFT JOIN investment_discretion_table d ON h.investment_discretion = d.id
             {where_clause}
@@ -707,7 +707,7 @@ def get_holding_by_accession_number(
             FROM holdings_normalised h
             LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
             LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
-            LEFT JOIN ssh_prnamt_type_table s ON h.shares_or_principal_type = s.id
+            LEFT JOIN share_type_table s ON h.shares_or_principal_type = s.id
             LEFT JOIN put_or_call_table p ON h.put_or_call = p.id
             LEFT JOIN investment_discretion_table d ON h.investment_discretion = d.id
             {where_clause}
