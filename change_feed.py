@@ -109,7 +109,7 @@ FILING_PAGE_QUERY = """
     WHERE f.form_type IN %(forms)s
       AND f.updated_at <= now() - make_interval(secs => %(lag)s)
       {keyset}
-    ORDER BY f.updated_at ASC, f.filing_id ASC
+    ORDER BY f.updated_at {order}, f.filing_id {order}
     LIMIT %(limit)s;
 """
 
@@ -274,26 +274,38 @@ def fetch_changes(
     cursor: Optional[str],
     limit: int,
     lag_seconds: float = DEFAULT_LAG_SECONDS,
+    direction: str = "forward",
 ) -> Tuple[List[FilingEnvelope], Optional[str], bool]:
     """
     One keyset page of complete filings.
 
+    ``direction`` = ``"forward"`` walks newer than the cursor (``(updated_at,
+    filing_id) >`` cursor, ASC); ``"backward"`` walks older (``<`` cursor, DESC).
+    With no cursor, forward starts at the oldest and backward at the newest head.
+
     Returns ``(items, next_cursor, has_more)`` where:
-      * ``next_cursor`` = the last row's cursor on ANY non-empty page (always
-        resumable); ``None`` only when the page is empty.
+      * ``next_cursor`` = the last row's cursor on ANY non-empty page — resume in
+        the SAME direction to continue; ``None`` only when the page is empty.
       * ``has_more`` = ``len(page) == limit`` (a separate "more right now" hint).
 
     Raises ``ValueError`` for a malformed cursor.
     """
+    # direction drives both the keyset comparator and the sort order. Only
+    # 'backward' flips it; any other value is treated as forward. These are
+    # code-controlled literals, never user text, so splicing them is injection-safe.
+    backward = direction == "backward"
+    comparator = "<" if backward else ">"
+    order = "DESC" if backward else "ASC"
+
     named = {"forms": FORM_TYPES, "lag": lag_seconds, "limit": limit}
     keyset = ""
     if cursor:
         cur_ts, cur_id = decode_cursor(cursor)  # raises ValueError -> 400
         named["cur_ts"] = cur_ts
         named["cur_id"] = cur_id
-        keyset = "AND (f.updated_at, f.filing_id) > (%(cur_ts)s::timestamptz, %(cur_id)s)"
+        keyset = f"AND (f.updated_at, f.filing_id) {comparator} (%(cur_ts)s::timestamptz, %(cur_id)s)"
 
-    db.execute(FILING_PAGE_QUERY.format(keyset=keyset), named)
+    db.execute(FILING_PAGE_QUERY.format(keyset=keyset, order=order), named)
     filings = db.fetchall()
     if not filings:
         return [], None, False

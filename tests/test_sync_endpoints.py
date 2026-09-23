@@ -118,6 +118,20 @@ class TestSyncEndpoints(unittest.TestCase):
         second_ids = {i["filing_id"] for i in second.json()["items"]}
         self.assertTrue(first_ids.isdisjoint(second_ids))
 
+    def test_changes_backward_walk(self):
+        """direction=backward returns newest-first (DESC by updated_at, filing_id)."""
+        data = self.client.get("/changes?direction=backward&limit=3").json()
+        items = data["items"]
+        if len(items) < 2:
+            return
+        keys = [(i["updated_at"], i["filing_id"]) for i in items]
+        self.assertEqual(keys, sorted(keys, reverse=True))
+
+    def test_changes_invalid_direction(self):
+        """An unknown direction is a 422 (validation error)."""
+        response = self.client.get("/changes?direction=sideways")
+        self.assertEqual(response.status_code, 422)
+
     def test_changes_feed_draining_to_null(self):
         """A cursor past the end yields empty items and a null next_cursor."""
         far_future = encode_cursor(datetime(2999, 1, 1, tzinfo=timezone.utc), 0)

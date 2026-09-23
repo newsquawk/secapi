@@ -50,6 +50,11 @@ def get_changes_feed(
     lag_seconds: float = Query(
         DEFAULT_LAG_SECONDS, ge=0, le=3600, description="Hide filings settled less than this many seconds ago"
     ),
+    direction: str = Query(
+        "forward",
+        pattern="^(forward|backward)$",
+        description="Walk newer than the cursor (forward) or older (backward); resume in the same direction",
+    ),
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -63,7 +68,7 @@ def get_changes_feed(
     `next_cursor` advances on any non-empty page and is null only when empty.
     """
     try:
-        items, next_cursor, has_more = fetch_changes(db, cursor, limit, lag_seconds)
+        items, next_cursor, has_more = fetch_changes(db, cursor, limit, lag_seconds, direction)
     except ValueError:
         raise HTTPException(
             status_code=400,

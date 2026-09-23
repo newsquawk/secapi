@@ -163,9 +163,10 @@ Returns an **opaque cursor** for the newest *settled* 13F filing. Pass it as `cu
 #### `GET /changes` — Cursor-Paginated Change Feed
 Drains changes page-by-page. Keyset-paginated over the composite `(updated_at, filing_id)` cursor: revisions of an already-served filing **re-surface** (their `updated_at` is DB-stamped on update), and a `lag_seconds` high-water mark prevents concurrent out-of-order commits from being skipped.
 * **Query Parameters**:
-  * `cursor` *(string, optional)*: Opaque cursor from a prior page's `next_cursor`. Omitted → start from the beginning.
-  * `limit` *(int, default=10, 1-25)*: Max filings per page. Kept low because each filing embeds **all** its holdings (rely on gzip at the proxy).
+  * `cursor` *(string, optional)*: Opaque cursor from a prior page's `next_cursor`. Omitted → start from the beginning (forward) or the newest head (backward).
+  * `limit` *(int, default=10, 1-25)*: Max filings per page. Kept low because each filing embeds **all** its holdings (responses are gzip-compressed).
   * `lag_seconds` *(float, default=5)*: Hide filings settled less than this many seconds ago.
+  * `direction` *(string, default=`forward`)*: `forward` walks newer than the cursor (`(updated_at, filing_id) >`, ASC); `backward` walks older (`<`, DESC). Resume in the **same** direction with the returned `next_cursor`.
 * **Response Model**: `ChangesResponse`
 * **Pagination semantics**: `next_cursor` = the last row's cursor on **any non-empty page** (always resumable); `null` **only** on an empty page. `has_more` = `len(page) == limit` (a separate "more right now" hint).
 * **Response Format**:
