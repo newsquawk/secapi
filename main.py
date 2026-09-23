@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -97,6 +98,13 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# Gzip: the /changes feed embeds all of a filing's holdings, so a mega-filing
+# (e.g. BlackRock ~50k holdings) is multi-MB of highly repetitive JSON that
+# compresses ~10x. minimum_size skips tiny payloads. The /stream SSE endpoint
+# opts out via a Content-Encoding: identity header (gzip would buffer the
+# event stream and defeat the doorbell's immediate delivery).
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # CORS setup
 origins_env = os.environ.get("CORS_ORIGINS", "").split(",")

@@ -144,5 +144,9 @@ async def stream_changes(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            # Opt out of GZipMiddleware: it buffers chunks, which would defeat the
+            # SSE doorbell's immediate delivery. Starlette's gzip passes through
+            # any response that already declares a Content-Encoding.
+            "Content-Encoding": "identity",
         },
     )
