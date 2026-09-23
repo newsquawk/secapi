@@ -18,7 +18,10 @@ APP_ENV = os.getenv("APP_ENV", "production").lower().strip()
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
 ENABLE_DOCS = DEBUG or os.getenv("ENABLE_DOCS", "false").lower() in ("1", "true", "yes", "on")
 EDGAR_IDENTITY = os.getenv("EDGAR_IDENTITY", "26b610663e50@company.co.uk")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", None)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("DEEPSEEK_API_KEY", None)
+DEEPSEEK_API_KEY = OPENROUTER_API_KEY  # Backwards compatibility alias
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1")
+AI_MODEL = os.getenv("AI_MODEL", "deepseek/deepseek-v4.1-flash")
 RATE_LIMIT = os.getenv("RATE_LIMIT", "120/minute")
 
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
@@ -38,14 +41,18 @@ logging.basicConfig(
 logger = logging.getLogger("secapi")
 
 # ---------------------------------------------------------------------------
-# AI Client
+# AI Client (OpenRouter / OpenAI compatible)
 # ---------------------------------------------------------------------------
 client: Optional[AsyncOpenAI] = None
-if DEEPSEEK_API_KEY:
+if OPENROUTER_API_KEY:
     client = AsyncOpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com",
-        timeout=10.0,
+        api_key=OPENROUTER_API_KEY,
+        base_url=AI_BASE_URL,
+        timeout=15.0,
+        default_headers={
+            "HTTP-Referer": "https://newsquawk.com",
+            "X-Title": "Newsquawk SEC API",
+        },
     )
 
 # ---------------------------------------------------------------------------

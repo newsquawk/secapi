@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from config import (
+    OPENROUTER_API_KEY,
+    AI_MODEL,
     DEEPSEEK_API_KEY,
     RATE_LIMIT,
     OPTION_PUT_CALL_NAMES,
@@ -186,8 +188,9 @@ async def openai_call(
     payload: HoldingsRequest = Body(...),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
-    if not DEEPSEEK_API_KEY or not client:
-        logger.error("DEEPSEEK_API_KEY is not configured. Cannot call OpenAI API.")
+    api_key_configured = OPENROUTER_API_KEY or DEEPSEEK_API_KEY
+    if not api_key_configured or not client:
+        logger.error("Neither OPENROUTER_API_KEY nor DEEPSEEK_API_KEY is configured. Cannot call AI API.")
         return JSONResponse(
             content={"summary": "API key not configured"}, status_code=503
         )
@@ -302,7 +305,7 @@ async def openai_call(
         {title}: {data_text}
         """
         response = await client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=AI_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -311,7 +314,7 @@ async def openai_call(
                 {"role": "user", "content": prompt},
             ],
             stream=False,
-            timeout=10.0,
+            timeout=15.0,
         )
         return response.choices[0].message.content
 

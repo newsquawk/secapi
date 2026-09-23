@@ -350,7 +350,7 @@ Convenience endpoint that automatically resolves and compares the two most recen
 ### 7. AI Summaries & Health Check
 
 #### `POST /api/ai_summary` — AI Portfolio Summary
-Accepts portfolio changes payload and generates an executive financial summary using DeepSeek LLM.
+Accepts portfolio changes payload and generates an executive financial summary using OpenRouter (default: `deepseek/deepseek-v4.1-flash`).
 * **Request Body**: `{"new_holdings": [...], "closed_positions": [...], "increased_holdings": [...], "decreased_holdings": [...]}`.
 * **Persistent Two-Tier Caching**: Results are deterministically hashed and stored in PostgreSQL (`ai_summaries`) and an in-memory LRU cache with auto-eviction (`popitem`). Repeated requests return in **<10ms** across all server workers without re-calling the LLM.
 
@@ -412,7 +412,7 @@ Located in [`scripts/`](scripts/):
 ### Prerequisites
 - Python 3.10+
 - PostgreSQL database populated with SEC 13F filing tables.
-- DeepSeek API Key (optional, for `/api/ai_summary`).
+- OpenRouter API Key (optional, for `/api/ai_summary`).
 
 ### Installation
 ```bash
@@ -444,7 +444,9 @@ Create a `.env` file or export the following environment variables:
 | `DB_PASSWORD` | *(required in prod)* | Database password |
 | `DB_POOL_MIN_CONN` | `4` | Minimum database pool connections |
 | `DB_POOL_MAX_CONN` | `20` | Maximum database pool connections |
-| `DEEPSEEK_API_KEY` | `null` | API key for AI summary endpoint |
+| `OPENROUTER_API_KEY`| `null` | API key for OpenRouter AI summary endpoint (or `DEEPSEEK_API_KEY`) |
+| `AI_MODEL` | `deepseek/deepseek-v4.1-flash` | Model ID on OpenRouter |
+| `AI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter OpenAI-compatible endpoint |
 | `RATE_LIMIT` | `120/minute` | Default per-client rate limit |
 | `CORS_ORIGINS` | `""` | Comma-separated allowed frontend origins |
 
