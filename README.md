@@ -25,7 +25,7 @@ A high-performance backend API built with **FastAPI** to serve and analyze SEC F
 
 ## ✨ Key Features & Feeds
 
-- **Real-Time Sync Stream (`/stream` & `/changes/{source}`)**: Event-driven SSE doorbell and cursor-paginated change feed for downstream ingestion (`content-hub`), delivering filing envelopes with full holding activities.
+- **Real-Time Sync Stream (`/stream` & `/changes`)**: Event-driven LISTEN/NOTIFY SSE doorbell and a source-less, cursor-paginated change feed for downstream ingestion (`content-hub`), delivering complete filings with all holdings embedded.
 - **Options Radar (`/activity/latest/options`)**: Tracks institutional Put & Call options trades (new positions, closed positions, increases, decreases) with filtering by ticker, contract type, action, and dollar value.
 - **Stock Activity Feed (`/activity/latest/v3`)**: Flat stream of common stock portfolio changes across recently processed 13F filings.
 - **Curated Stories (`/stories/latest/v2`)**: Generates structured summary cards showing top position changes for each filing.
@@ -148,22 +148,26 @@ Aggregates recent filings into structured story cards highlighting top new, clos
 
 High-performance event-driven ingestion pipeline designed for downstream consumers (`content-hub`). Delivers filing-level envelopes containing enriched holding activity changes (`activities[]`) without requiring clients to crawl historical data or poll in tight loops.
 
+The feed is **source-less**: each item is one complete 13F filing with **all** of its holdings embedded in `activities[]` (common stock **and** options, every position tagged `is_common_stock` / `put_or_call`). Content Hub owns the slicing, faceting and per-holding explosion. Requires migration `scripts/006_change_cursor.sql`.
+
 #### `GET /changes/head` — Latest Cursor Bookmark
-Returns the highest `filing_id` currently recorded in PostgreSQL. Allows sync pollers on first startup to tail from the current moment forward rather than backfilling all 288k historical filings.
+Returns an **opaque cursor** for the newest *settled* 13F filing. Pass it as `cursor` to `GET /changes` to tail live filings from 'now' rather than backfilling all ~288k historical filings.
 * **Response Model**: `ChangesHeadResponse`
-* **Response**: `{"head_cursor": "340190"}`
+* **Response**: `{"head_cursor": "MjAyNi0wOS0yM1QxNDowMzoyMi4xMjM0NTZaXzM0MDE5MA=="}`
+* **Query Parameters**: `lag_seconds` *(float, default=5)* — hide filings settled less than this many seconds ago.
 * **Example**:
   ```bash
   curl "http://localhost:8000/changes/head"
   ```
 
-#### `GET /changes/{source}` — Cursor-Paginated Change Feed
-Drains changes page-by-page. For each filing, returns top-level metadata (`accession_number`, `cik`, `company_name`, `form_type`, `aum`) and the full array of `activities[]` (holding deltas with `weight_pct`, `value_pct`, `form_type`).
-* **Path Parameters**: `source` — `stocks` (common stocks), `options` (derivatives), or `newsquawk-sec-filings-stocks`.
+#### `GET /changes` — Cursor-Paginated Change Feed
+Drains changes page-by-page. Keyset-paginated over the composite `(updated_at, filing_id)` cursor: revisions of an already-served filing **re-surface** (their `updated_at` is DB-stamped on update), and a `lag_seconds` high-water mark prevents concurrent out-of-order commits from being skipped.
 * **Query Parameters**:
-  * `cursor` *(string, optional)*: Exclusive starting filing ID. If omitted, starts from the beginning.
-  * `limit` *(int, default=50, 1-100)*: Maximum number of filings per page.
+  * `cursor` *(string, optional)*: Opaque cursor from a prior page's `next_cursor`. Omitted → start from the beginning.
+  * `limit` *(int, default=10, 1-25)*: Max filings per page. Kept low because each filing embeds **all** its holdings (rely on gzip at the proxy).
+  * `lag_seconds` *(float, default=5)*: Hide filings settled less than this many seconds ago.
 * **Response Model**: `ChangesResponse`
+* **Pagination semantics**: `next_cursor` = the last row's cursor on **any non-empty page** (always resumable); `null` **only** on an empty page. `has_more` = `len(page) == limit` (a separate "more right now" hint).
 * **Response Format**:
   ```json
   {
@@ -177,6 +181,10 @@ Drains changes page-by-page. For each filing, returns top-level metadata (`acces
         "filing_date": "2026-02-14",
         "period_of_report": "2025-12-31",
         "aum": 299253556246,
+        "file_number": "028-12345",
+        "filing_directory": "0001067983-26-000012",
+        "created_at": "2026-02-14T21:03:11Z",
+        "updated_at": "2026-02-14T21:03:11Z",
         "previous_filing_id": 285400,
         "previous_accession_number": "0001067983-25-000098",
         "activities": [
@@ -184,6 +192,8 @@ Drains changes page-by-page. For each filing, returns top-level metadata (`acces
             "issuer_name": "APPLE INC",
             "cusip": "037833100",
             "ticker": "AAPL",
+            "is_common_stock": true,
+            "put_or_call": null,
             "change_type": "increased",
             "current_shares": 915560382,
             "current_value": 150975906991,
@@ -195,30 +205,32 @@ Drains changes page-by-page. For each filing, returns top-level metadata (`acces
         ]
       }
     ],
-    "next_cursor": "288050",
+    "next_cursor": "MjAyNi0wMi0xNFQyMTowMzoxMS4wMDAwMDBaXzI4ODA1MA==",
     "has_more": true
   }
   ```
-  *(When no further filings exist beyond `cursor`, `next_cursor` is `null` and `has_more` is `false`)*.
+  *(When no filings exist beyond `cursor`, `items` is `[]`, `next_cursor` is `null` and `has_more` is `false`)*.
 * **Example**:
   ```bash
-  curl "http://localhost:8000/changes/stocks?cursor=340000&limit=25"
+  curl "http://localhost:8000/changes?limit=25"
   ```
 
 #### `GET /stream` — Real-Time SSE Doorbell
-Persistent Server-Sent Events (SSE) stream. Whenever `secpoll` or any worker inserts a new 13F filing into PostgreSQL, `secapi` immediately emits a lightweight event notification over the stream. Downstream clients use this signal to trigger a drain on `GET /changes/{source}`.
+Persistent Server-Sent Events (SSE) stream backed by Postgres **LISTEN/NOTIFY** (not polling). A DB trigger (migration `006`) fires `pg_notify('filing_changes', …)` on every 13F insert or revision; each uvicorn worker holds a `LISTEN` connection and relays it to connected clients, who then drain `GET /changes` from their own cursor.
 * **Headers**: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`
 * **Query Parameters**:
-  * `once` *(boolean, default=false)*: Emit initial connection frame and close immediately (used for automated health probes and connectivity testing).
+  * `once` *(boolean, default=false)*: Emit the connection frame and close (health probes / tests).
+  * `replay_latest` *(boolean, default=false)*: Replay the last change signal on connect.
+  * `lag_seconds` *(float, default=5)*: Applied to the head reported in the greeting frame.
 * **SSE Event Stream Format**:
   ```text
   event: connected
-  data: {"head": "340190"}
+  data: {"head": "MjAyNi0wOS0yM1QxNDowMzoyMi4xMjM0NTZaXzM0MDE5MA=="}
 
   event: change
-  data: {"source": "stocks", "head": "340195"}
+  data: {"id": "0001067983-26-000012", "filing_id": 340195, "op": "insert", "ts": "2026-09-23T14:03:22.123456Z"}
 
-  : keepalive
+  : ping
   ```
 * **Example**:
   ```bash
@@ -363,7 +375,7 @@ The test suite validates data normalization accuracy against historical stock ma
 2. **Characterization Regression (`tests/test_characterization.py`)**:
    - Verifies live query outputs against baseline snapshots (`tests/snapshots/baseline_current.json`) across 4 test cohorts (Pre-2023, Penny Stocks, Post-2023 Standard, Options) to guarantee zero unwanted output drift.
 3. **Change Feed & Stream (`tests/test_sync_endpoints.py`)**:
-   - Validates `GET /changes/head`, cursor pagination draining down to `next_cursor: null`, and persistent `/stream` SSE connection frames.
+   - Unit-tests the opaque `(updated_at, filing_id)` cursor (round-trip, ordering, invalid-token rejection) and validates `GET /changes/head`, `GET /changes` cursor-walk draining to `next_cursor: null`, and persistent `/stream` SSE connection frames.
 4. **Flow Top Changes & Options (`tests/test_flow_top_changes.py`)**:
    - Validates uppercase CUSIP uniqueness, sort-by validation, and candidate pushdown filtering for options activity.
 
@@ -378,6 +390,8 @@ Located in [`scripts/`](scripts/):
   - Supports `--dry-run` and configurable `--batch-size`.
 * **SQL Schema Reference (`scripts/005_deduplicate_issuers.sql`)**:
   - DDL reference for `holdings_normalised`, CUSIP uppercase constraints, and indexes.
+* **Change Cursor (`scripts/006_change_cursor.sql`)**:
+  - Establishes the monotonic change cursor for the Content Hub feed: a BEFORE trigger that DB-stamps `filings.updated_at` on every insert/update (so revisions re-surface), a backfill of historical rows, an AFTER trigger emitting `pg_notify('filing_changes', …)` on 13F writes, and the `(updated_at, filing_id)` keyset index. Run manually, off-peak; idempotent.
 
 ---
 

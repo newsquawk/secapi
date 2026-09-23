@@ -53,6 +53,7 @@ from utils import (
     resolve_identifiers,
     get_free_float,
 )
+from change_signal import SignalBroker, start_signal
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +65,19 @@ async def lifespan(app: FastAPI):
     logger.info("secapi starting")
     init_db_pool()
     init_ai_summary_table()
-    yield
-    logger.info("secapi shutting down")
-    close_db_pool()
+
+    # Content Hub doorbell: one LISTEN thread + broker per uvicorn worker.
+    broker = SignalBroker()
+    app.state.signal_broker = broker
+    listen_thread = start_signal(broker)
+
+    try:
+        yield
+    finally:
+        logger.info("secapi shutting down")
+        listen_thread.stop()
+        listen_thread.join(timeout=5)
+        close_db_pool()
 
 
 # ---------------------------------------------------------------------------

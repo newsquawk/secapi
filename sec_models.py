@@ -161,7 +161,12 @@ class TopStockChangesResponse(BaseModel):
 
 
 class FilingEnvelope(BaseModel):
-    """Filing envelope carrying metadata and holding activities for downstream ingestion."""
+    """
+    A complete 13F filing for the Content Hub change feed: all filing-level
+    fields plus every holding embedded in ``activities`` (common stock AND
+    options, each tagged with is_common_stock / put_or_call). Content Hub owns
+    the mapping/faceting/explosion — secapi hands over the whole record.
+    """
 
     filing_id: int
     accession_number: str
@@ -171,6 +176,11 @@ class FilingEnvelope(BaseModel):
     filing_date: dt.date
     period_of_report: dt.date
     aum: Optional[int] = None
+    # Filing-level metadata (lets Content Hub reproduce the Filings list widget).
+    file_number: Optional[str] = None
+    filing_directory: Optional[str] = None
+    created_at: Optional[dt.datetime] = None
+    updated_at: Optional[dt.datetime] = None
     previous_filing_id: Optional[int] = None
     previous_accession_number: Optional[str] = None
     activities: List[HoldingActivity] = []
