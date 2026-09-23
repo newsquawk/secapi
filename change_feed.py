@@ -134,13 +134,18 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             SUM(h.value) AS total_value,
             SUM(h.shares_or_principal_amount) AS total_shares,
             tc.is_common_stock,
-            poc.name AS put_or_call
+            -- Normalise put_or_call: the source dictionary holds duplicate case
+            -- variants (PUT/CALL and Put/Call). Uppercasing collapses them so a
+            -- filing labelled 'Call' does not diff against a predecessor's 'CALL'
+            -- as a spurious new/closed pair, and Content Hub receives clean values.
+            -- upper(NULL) stays NULL, so stock holdings are unaffected.
+            upper(poc.name) AS put_or_call
         FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
-        GROUP BY h.filing_id, i.cusip, tc.is_common_stock, poc.name
+        GROUP BY h.filing_id, i.cusip, tc.is_common_stock, upper(poc.name)
     ),
     HoldingsComparison AS (
         SELECT
