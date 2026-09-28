@@ -1,0 +1,16 @@
+# Normalize all text files to LF in the repository and on checkout, so the
+# Windows/WSL editor writing CRLF no longer shows whole files as "modified".
+* text=auto eol=lf
+
+# Large data files are left exactly as committed (avoid churning them here).
+*.csv -text
+
+# Explicit binaries (never touch their bytes).
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.gz   binary
+*.zip  binary
+*.pdf  binary
