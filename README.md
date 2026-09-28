@@ -396,6 +396,25 @@ Located in [`scripts/`](scripts/):
 
 ---
 
+## 🔐 Authentication
+
+Keycloak bearer-token auth via `newsquawk-auth`, configured through `AUTH_`-prefixed env vars (see `auth_settings.py` / `.env.example`):
+
+| Var | Purpose |
+|-----|---------|
+| `AUTH_JWKS_URL` | Keycloak JWKS endpoint. **Required in production.** |
+| `AUTH_AUDIENCE` | Optional expected `aud`. Unset → audience not checked (signature + expiry still are). |
+| `AUTH_SYNC_REALM_ROLE` | Realm role a **service account** must hold for the sync endpoints (default `sec-sync`). |
+| `AUTH_STUB_MODE` / `AUTH_STUB_SECRET` | Local dev/test only (HS256 stub). Never in production. |
+
+Access tiers:
+- **Public:** `GET /health`, `GET /`, `GET /stream` (SSE doorbell), and — **for now** — the `filings`, `activity`, `flow`, `comparisons` routers.
+- **Service account + `AUTH_SYNC_REALM_ROLE`:** `GET /changes`, `GET /changes/head` — machine callers only (`401` unauthenticated, `403` if not a service account or missing the role).
+
+> JWKS auth on the data routers is **wired but currently disabled** so it doesn't break the frontend. To enforce it, add `dependencies=[require_authenticated]` to those router includes in `main.py`. Only the sync endpoints are protected today.
+
+In non-production, if `AUTH_JWKS_URL` is unset the app falls back to stub mode so local dev/tests run without a Keycloak. This service performs no outbound service-to-service calls, so it has **no service account of its own** — only receiver-side verification.
+
 ## 🛠️ Technology Stack
 
 - **Framework**: [FastAPI](https://fastapi.tiangolo.com/)

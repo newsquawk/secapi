@@ -55,6 +55,7 @@ from utils import (
     get_free_float,
 )
 from change_signal import SignalBroker, start_signal
+from auth import require_authenticated
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,11 @@ def health():
 # ---------------------------------------------------------------------------
 # Mount Routers
 # ---------------------------------------------------------------------------
+# NOTE: JWKS auth on the data routers is intentionally DISABLED for now (it would
+# break the current frontend). The wiring is kept — to re-enable, add
+# `dependencies=[require_authenticated]` to these includes.
+# The sync router keeps its own per-endpoint auth (service-account guard on
+# /changes*, /stream public).
 app.include_router(filings.router)
 app.include_router(activity.router)
 app.include_router(sync.router)

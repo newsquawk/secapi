@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from config import logger
 from database import get_db_cursor, get_db_connection, INTERNAL_ERROR_DETAIL
 from sec_models import ChangesHeadResponse, ChangesResponse
+from auth import sync_dependencies
 import change_feed
 from change_feed import (
     DEFAULT_LIMIT,
@@ -22,7 +23,12 @@ from change_feed import (
 router = APIRouter()
 
 
-@router.get("/changes/head", response_model=ChangesHeadResponse, tags=["Sync"])
+@router.get(
+    "/changes/head",
+    response_model=ChangesHeadResponse,
+    tags=["Sync"],
+    dependencies=sync_dependencies,
+)
 def get_changes_head(
     lag_seconds: float = Query(
         DEFAULT_LAG_SECONDS, ge=0, le=3600, description="Hide filings settled less than this many seconds ago"
@@ -41,7 +47,12 @@ def get_changes_head(
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
 
 
-@router.get("/changes", response_model=ChangesResponse, tags=["Sync"])
+@router.get(
+    "/changes",
+    response_model=ChangesResponse,
+    tags=["Sync"],
+    dependencies=sync_dependencies,
+)
 def get_changes_feed(
     cursor: Optional[str] = Query(None, description="Opaque cursor from a prior page's next_cursor"),
     limit: int = Query(

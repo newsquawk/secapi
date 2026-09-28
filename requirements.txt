@@ -43,6 +43,7 @@ pyarrow==21.0.0
 pycparser==3.0
 pydantic==2.11.9
 pydantic_core==2.33.2
+pydantic-settings==2.6.1
 Pygments==2.19.2
 pyrate-limiter==3.9.0
 python-dateutil==2.9.0.post0
@@ -71,3 +72,6 @@ websockets==16.0
 wrapt==2.1.2
 xlsxwriter==3.2.9
 yfinance==1.3.0
+
+# Newsquawk shared JWT/JWKS auth (Keycloak). Pinned to a release tag.
+newsquawk-auth @ git+https://github.com/newsquawk/kc-fastapi-auth.git@v0.3.1
