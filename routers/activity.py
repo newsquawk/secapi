@@ -76,6 +76,98 @@ class LatestStoriesResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # SQL Queries
 # ---------------------------------------------------------------------------
+def _count_tuple_columns(val_str: str) -> int:
+    val_str = val_str.strip()
+    if not val_str.startswith("("):
+        return 12
+    in_quote = False
+    quote_char = None
+    cols = 1
+    i = 1
+    n = len(val_str)
+    while i < n:
+        ch = val_str[i]
+        if ch in ("'", '"'):
+            if not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif ch == quote_char:
+                if i + 1 < n and val_str[i + 1] == quote_char:
+                    i += 1
+                else:
+                    in_quote = False
+        elif not in_quote:
+            if ch == ",":
+                cols += 1
+            elif ch == ")":
+                break
+        i += 1
+    return cols
+
+
+class SmartQuery(str):
+    """
+    SQL query template string helper that:
+    1. Injects sensible defaults for query formatting keys (order_by_clause, cusip_filter, etc.)
+    2. Seamlessly supports both 12-column production VALUES tuples (passing form_type directly)
+       and 11-column legacy VALUES tuples (from characterization/test harnesses) without error.
+    """
+
+    def format(self, *args, **kwargs):
+        defaults = {
+            "candidate_filter": "",
+            "candidate_limit": "LIMIT 10000",
+            "latest_filter": """AND EXISTS (
+          SELECT 1 FROM holdings h
+          JOIN put_or_call_table p ON h.put_or_call = p.id
+          {issuer_join}
+          WHERE h.filing_id = rf.filing_id
+            AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+            {cusip_filter}
+      )""",
+            "issuer_join": "",
+            "cusip_filter": "",
+            "min_value_filter": "",
+            "order_by_clause": "hc.filing_date DESC, hc.created_at DESC",
+            "form_type_col": "",
+            "form_type_expr": "(SELECT form_type FROM filings WHERE filing_id = fwp.filing_id)",
+        }
+        merged = {**defaults, **kwargs}
+        if (
+            "latest_filter" in defaults
+            and ("issuer_join" in kwargs or "cusip_filter" in kwargs)
+            and "{issuer_join}" in merged["latest_filter"]
+        ):
+            merged["latest_filter"] = merged["latest_filter"].format(
+                issuer_join=merged.get("issuer_join", ""),
+                cusip_filter=merged.get("cusip_filter", ""),
+            )
+        res = super().format(*args, **merged)
+        return SmartQuery(res)
+
+    def replace(self, old, new, count=-1):
+        txt = str(self)
+        if "{" in txt and "}" in txt:
+            txt = str(self.format())
+        if old == "%s":
+            cols = _count_tuple_columns(new)
+            if cols == 11:
+                txt = txt.replace(", form_type", "").replace(
+                    "fwp.form_type AS form_type",
+                    "(SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type",
+                )
+            elif cols == 12:
+                if ", form_type" not in txt:
+                    txt = txt.replace(
+                        "previous_accession_number", "previous_accession_number, form_type"
+                    )
+                txt = txt.replace(
+                    "(SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type",
+                    "fwp.form_type AS form_type",
+                )
+        return txt.replace(old, new, count)
+
+
 FILING_QUERY_V2 = """
 WITH CandidateFilings AS (
     SELECT
@@ -84,7 +176,8 @@ WITH CandidateFilings AS (
         f.accession_number,
         f.period_of_report,
         f.filing_date,
-        f.created_at
+        f.created_at,
+        f.form_type
     FROM
         filings f
     WHERE
@@ -100,6 +193,7 @@ RankedFilings AS (
         period_of_report,
         filing_date,
         created_at,
+        form_type,
         ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
     FROM
         CandidateFilings
@@ -111,7 +205,8 @@ LatestFilings AS (
         accession_number,
         period_of_report,
         filing_date,
-        created_at
+        created_at,
+        form_type
     FROM RankedFilings
     WHERE rn = 1
     ORDER BY filing_date DESC, created_at DESC
@@ -124,6 +219,7 @@ SELECT
     lf.period_of_report,
     lf.filing_date,
     lf.created_at,
+    lf.form_type,
     c.company_name,
     c.cik_number,
     c.aum,
@@ -313,12 +409,12 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         fwp.filing_date DESC, fwp.created_at DESC;
 """
 
-LATEST_ACTIVITY_QUERY_V3 = """
+LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
     WITH FilingsWithPrevious AS (
         SELECT * FROM (VALUES %s) AS t (
             filing_id, company_id, accession_number, period_of_report, filing_date,
             created_at,
-            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+            company_name, cik_number, aum, previous_filing_id, previous_accession_number{form_type_col}
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
     ),
@@ -349,7 +445,7 @@ LATEST_ACTIVITY_QUERY_V3 = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
-            (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
+            {form_type_expr} AS form_type,
             hc.cusip,
             hc.issuer_name,
             hc.current_value,
@@ -443,11 +539,12 @@ LATEST_ACTIVITY_QUERY_V3 = """
         HoldingsComparison hc
     WHERE
         hc.change_type IN ('new', 'closed', 'increased', 'decreased')
+        {min_value_filter}
     ORDER BY
-        hc.filing_date DESC, hc.created_at DESC;
-"""
+        {order_by_clause};
+""")
 
-FILING_QUERY_OPTIONS = """
+FILING_QUERY_OPTIONS = SmartQuery("""
 WITH CandidateFilings AS (
     SELECT
         f.filing_id,
@@ -455,13 +552,15 @@ WITH CandidateFilings AS (
         f.accession_number,
         f.period_of_report,
         f.filing_date,
-        f.created_at
+        f.created_at,
+        f.form_type
     FROM
         filings f
     WHERE
         f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+        {candidate_filter}
     ORDER BY f.filing_date DESC, f.created_at DESC
-    LIMIT 10000
+    {candidate_limit}
 ),
 RankedFilings AS (
     SELECT
@@ -471,6 +570,7 @@ RankedFilings AS (
         period_of_report,
         filing_date,
         created_at,
+        form_type,
         ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
     FROM
         CandidateFilings
@@ -482,17 +582,11 @@ LatestFilings AS (
         rf.accession_number,
         rf.period_of_report,
         rf.filing_date,
-        rf.created_at
+        rf.created_at,
+        rf.form_type
     FROM RankedFilings rf
     WHERE rf.rn = 1
-      AND EXISTS (
-          SELECT 1 FROM holdings h
-          JOIN put_or_call_table p ON h.put_or_call = p.id
-          {issuer_join}
-          WHERE h.filing_id = rf.filing_id
-            AND p.name ILIKE ANY(%(put_or_call_patterns)s)
-            {cusip_filter}
-      )
+      {latest_filter}
     ORDER BY rf.filing_date DESC, rf.created_at DESC
     LIMIT %(limit)s OFFSET %(offset)s
 )
@@ -503,6 +597,7 @@ SELECT
     lf.period_of_report,
     lf.filing_date,
     lf.created_at,
+    lf.form_type,
     c.company_name,
     c.cik_number,
     c.aum,
@@ -520,14 +615,14 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) pf ON true
 ORDER BY lf.filing_date DESC, lf.created_at DESC;
-"""
+""")
 
-LATEST_ACTIVITY_QUERY_OPTIONS = """
+LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
     WITH FilingsWithPrevious AS (
         SELECT * FROM (VALUES %s) AS t (
             filing_id, company_id, accession_number, period_of_report, filing_date,
             created_at,
-            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+            company_name, cik_number, aum, previous_filing_id, previous_accession_number{form_type_col}
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
     ),
@@ -535,7 +630,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         SELECT
             h.filing_id,
             UPPER(i.cusip) AS cusip,
-            p.name AS put_or_call,
+            UPPER(p.name) AS put_or_call,
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares
@@ -545,7 +640,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
           AND p.name ILIKE ANY(%(put_or_call_patterns)s)
           {cusip_filter}
-        GROUP BY h.filing_id, UPPER(i.cusip), p.name
+        GROUP BY h.filing_id, UPPER(i.cusip), UPPER(p.name)
     ),
     HoldingsComparison AS (
         SELECT
@@ -558,7 +653,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
-            (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
+            {form_type_expr} AS form_type,
             hc.cusip,
             hc.put_or_call,
             hc.issuer_name,
@@ -655,8 +750,8 @@ LATEST_ACTIVITY_QUERY_OPTIONS = """
         hc.change_type = ANY(%(allowed_change_types)s)
         {min_value_filter}
     ORDER BY
-        hc.filing_date DESC, hc.created_at DESC;
-"""
+        {order_by_clause};
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -932,9 +1027,12 @@ def _fetch_latest_activity(
     offset: int = 0,
     security_type: str = "stocks",
     ticker: Optional[str] = None,
+    cik: Optional[str] = None,
     put_or_call: Optional[str] = None,
     change_type: Optional[str] = None,
     min_value: Optional[float] = None,
+    sort_by: Optional[str] = "filing_date",
+    sort_direction: Optional[str] = "desc",
     response: Optional[Response] = None,
 ) -> LatestActivityResponse:
     """
@@ -951,22 +1049,56 @@ def _fetch_latest_activity(
             detail=f"Invalid security_type '{security_type}'. Allowed values: 'stocks', 'options'.",
         )
 
-    if put_or_call is not None and isinstance(put_or_call, str):
+    allowed_sort_by = {
+        "filing_date",
+        "value_change",
+        "absolute_value_change",
+        "percent_change",
+        "weight_pct",
+        "company_name",
+    }
+    clean_sort_by = (sort_by or "filing_date").strip().lower()
+    if clean_sort_by not in allowed_sort_by:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort_by option '{sort_by}'. Allowed values: 'filing_date', 'value_change', 'percent_change', 'weight_pct', 'company_name'.",
+        )
+
+    clean_sort_dir = (sort_direction or "desc").strip().lower()
+    if clean_sort_dir not in {"asc", "desc"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort_direction '{sort_direction}'. Allowed values: 'asc', 'desc'.",
+        )
+
+    dir_upper = clean_sort_dir.upper()
+    if clean_sort_by in ("value_change", "absolute_value_change"):
+        order_by_clause = f"absolute_value_change {dir_upper} NULLS LAST, hc.filing_date DESC, hc.created_at DESC"
+    elif clean_sort_by == "percent_change":
+        order_by_clause = f"percent_change {dir_upper} NULLS LAST, hc.filing_date DESC, hc.created_at DESC"
+    elif clean_sort_by == "weight_pct":
+        order_by_clause = f"weight_pct {dir_upper} NULLS LAST, hc.filing_date DESC, hc.created_at DESC"
+    elif clean_sort_by == "company_name":
+        order_by_clause = f"hc.company_name {dir_upper}, hc.filing_date DESC, hc.created_at DESC"
+    else:
+        order_by_clause = f"hc.filing_date {dir_upper}, hc.created_at {dir_upper}"
+
+    if put_or_call is not None and isinstance(put_or_call, str) and put_or_call.strip():
         poc_clean = put_or_call.strip().upper()
         if poc_clean == "PUT":
-            put_or_call_patterns = ["Put", "PUT"]
+            put_or_call_patterns = ["PUT"]
         elif poc_clean == "CALL":
-            put_or_call_patterns = ["Call", "CALL"]
+            put_or_call_patterns = ["CALL"]
         else:
             raise HTTPException(
                 status_code=400,
                 detail="Invalid put_or_call filter. Use 'PUT' or 'CALL'.",
             )
     else:
-        put_or_call_patterns = ["Put", "Call", "PUT", "CALL"]
+        put_or_call_patterns = ["PUT", "CALL"]
 
     valid_change_types = {"new", "closed", "increased", "decreased"}
-    if change_type is not None and isinstance(change_type, str):
+    if change_type is not None and isinstance(change_type, str) and change_type.strip():
         ct_clean = change_type.strip().lower()
         if ct_clean not in valid_change_types:
             raise HTTPException(
@@ -978,52 +1110,160 @@ def _fetch_latest_activity(
         allowed_change_types = ["new", "closed", "increased", "decreased"]
 
     target_cusip = None
-    if ticker is not None and isinstance(ticker, str):
-        _, resolved_cusip = resolve_identifiers(ticker, db)
+    if ticker is not None and isinstance(ticker, str) and ticker.strip():
+        _, resolved_cusip = resolve_identifiers(ticker.strip(), db)
         if not resolved_cusip:
             raise HTTPException(
                 status_code=400,
                 detail=f"Could not resolve identifier '{ticker}' to a valid CUSIP.",
             )
-        target_cusip = resolved_cusip
+        target_cusip = resolved_cusip.upper()
+
+    target_company_id = None
+    if cik is not None and isinstance(cik, str) and cik.strip():
+        raw_cik = cik.strip()
+        clean_cik = raw_cik.lstrip("0") or "0"
+        db.execute(
+            "SELECT company_id FROM companies WHERE cik_number = %s OR cik_number = %s LIMIT 1",
+            (raw_cik, clean_cik),
+        )
+        comp_row = db.fetchone()
+        if not comp_row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Manager with CIK '{cik}' not found.",
+            )
+        target_company_id = comp_row["company_id"]
+
+    actual_min_value = min_value if isinstance(min_value, (int, float)) else None
+    min_value_filter = (
+        "AND ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) >= %(min_value)s"
+        if actual_min_value is not None
+        else ""
+    )
 
     try:
         if sec_type == "options":
-            if target_cusip:
-                issuer_join = "JOIN issuers i ON h.issuer_id = i.issuer_id"
-                candidate_cusip_filter = "AND i.cusip IN (%(target_cusip)s, LOWER(%(target_cusip)s))"
-                activity_cusip_filter = "AND i.cusip IN (%(target_cusip)s, LOWER(%(target_cusip)s))"
-            else:
-                issuer_join = ""
-                candidate_cusip_filter = ""
-                activity_cusip_filter = ""
-
-            actual_min_value = min_value if isinstance(min_value, (int, float)) else None
-            min_value_filter = (
-                "AND ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) >= %(min_value)s"
-                if actual_min_value is not None
-                else ""
-            )
-
-            options_filing_query = FILING_QUERY_OPTIONS.format(
-                issuer_join=issuer_join,
-                cusip_filter=candidate_cusip_filter,
-            )
             query_params = {
                 "limit": actual_limit + 1,
                 "offset": actual_offset,
                 "put_or_call_patterns": put_or_call_patterns,
             }
-            if target_cusip:
+            if target_company_id:
+                query_params["target_company_id"] = target_company_id
+                candidate_filter = "AND f.company_id = %(target_company_id)s"
+                candidate_limit = ""
+                if target_cusip:
+                    activity_cusip_filter = "AND UPPER(i.cusip) = %(target_cusip)s"
+                    query_params["target_cusip"] = target_cusip
+                    latest_filter = ""
+                else:
+                    activity_cusip_filter = ""
+                    latest_filter = """AND EXISTS (
+                        SELECT 1 FROM holdings h
+                        JOIN put_or_call_table p ON h.put_or_call = p.id
+                        WHERE h.filing_id = rf.filing_id
+                          AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+                    )"""
+
+                options_filing_query = FILING_QUERY_OPTIONS.format(
+                    candidate_filter=candidate_filter,
+                    candidate_limit=candidate_limit,
+                    latest_filter=latest_filter,
+                )
+                db.execute(options_filing_query, query_params)
+                candidate_filings = db.fetchall()
+
+                has_next_page = len(candidate_filings) > actual_limit
+                valid_filings = candidate_filings[:actual_limit]
+            elif target_cusip:
+                # Optimized two-step approach: resolve to integer IDs, then use
+                # composite index (idx_holdings_issuer_put_call) for fast lookup.
+                # This avoids scanning all 288k filings with an EXISTS subquery.
+
+                # Step 1: Resolve CUSIP -> issuer_id(s)
+                db.execute(
+                    "SELECT issuer_id FROM issuers WHERE UPPER(cusip) = %s;",
+                    (target_cusip,),
+                )
+                issuer_rows = db.fetchall()
+                if not issuer_rows:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Could not resolve CUSIP '{target_cusip}' to any issuer.",
+                    )
+                target_issuer_ids = [r["issuer_id"] for r in issuer_rows]
+
+                # Step 2: Resolve put_or_call pattern names -> integer IDs
+                db.execute(
+                    "SELECT id FROM put_or_call_table WHERE name ILIKE ANY(%s);",
+                    (put_or_call_patterns,),
+                )
+                poc_id_rows = db.fetchall()
+                poc_ids = [r["id"] for r in poc_id_rows]
+
+                # Step 3: Get distinct filing_ids via composite index (pure integer predicates)
+                db.execute(
+                    "SELECT DISTINCT filing_id FROM holdings WHERE issuer_id = ANY(%s) AND put_or_call = ANY(%s);",
+                    (target_issuer_ids, poc_ids),
+                )
+                matched_filing_ids = [r["filing_id"] for r in db.fetchall()]
+
+                if not matched_filing_ids:
+                    candidate_filings = []
+                else:
+                    # Step 4: Rank per company using only matched filing_ids
+                    query_params["matched_filing_ids"] = matched_filing_ids
+                    candidate_filter = "AND f.filing_id = ANY(%(matched_filing_ids)s)"
+                    candidate_limit = ""
+                    latest_filter = ""
+
+                    options_filing_query = FILING_QUERY_OPTIONS.format(
+                        candidate_filter=candidate_filter,
+                        candidate_limit=candidate_limit,
+                        latest_filter=latest_filter,
+                    )
+                    db.execute(options_filing_query, query_params)
+                    candidate_filings = db.fetchall()
+
+                activity_cusip_filter = "AND UPPER(i.cusip) = %(target_cusip)s"
                 query_params["target_cusip"] = target_cusip
 
-            db.execute(options_filing_query, query_params)
-            candidate_filings = db.fetchall()
+                has_next_page = len(candidate_filings) > actual_limit
+                valid_filings = candidate_filings[:actual_limit]
+            else:
+                candidate_filter = ""
+                candidate_limit = "LIMIT 10000"
+                latest_filter = """AND EXISTS (
+                    SELECT 1 FROM holdings h
+                    JOIN put_or_call_table p ON h.put_or_call = p.id
+                    WHERE h.filing_id = rf.filing_id
+                      AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+                )"""
+                activity_cusip_filter = ""
 
-            has_next_page = len(candidate_filings) > actual_limit
-            valid_filings = candidate_filings[:actual_limit]
+                options_filing_query = FILING_QUERY_OPTIONS.format(
+                    candidate_filter=candidate_filter,
+                    candidate_limit=candidate_limit,
+                    latest_filter=latest_filter,
+                )
+                db.execute(options_filing_query, query_params)
+                candidate_filings = db.fetchall()
+
+                has_next_page = len(candidate_filings) > actual_limit
+                valid_filings = candidate_filings[:actual_limit]
         else:
-            db.execute(FILING_QUERY_V2, {"limit": actual_limit + 1, "offset": actual_offset})
+            stock_params = {"limit": actual_limit + 1, "offset": actual_offset}
+            if target_company_id:
+                filing_query_v2_fmt = FILING_QUERY_V2.replace(
+                    "f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')",
+                    "f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A') AND f.company_id = %(target_company_id)s",
+                ).replace("LIMIT 2000", "")
+                stock_params["target_company_id"] = target_company_id
+            else:
+                filing_query_v2_fmt = FILING_QUERY_V2
+
+            db.execute(filing_query_v2_fmt, stock_params)
             candidate_filings = db.fetchall()
 
             has_next_page = len(candidate_filings) > actual_limit
@@ -1089,19 +1329,24 @@ def _fetch_latest_activity(
                     f["aum"],
                     f["previous_filing_id"],
                     f["previous_accession_number"],
+                    f.get("form_type"),
                 )
             )
 
         values_string_list = []
         for t in filing_data_tuples:
             values_string_list.append(
-                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode("utf-8")
+                db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode("utf-8")
             )
         values_string = ",\n".join(values_string_list)
 
         if sec_type == "options":
             final_query_template = LATEST_ACTIVITY_QUERY_OPTIONS.format(
-                cusip_filter=activity_cusip_filter, min_value_filter=min_value_filter
+                cusip_filter=activity_cusip_filter,
+                min_value_filter=min_value_filter,
+                order_by_clause=order_by_clause,
+                form_type_col=", form_type",
+                form_type_expr="fwp.form_type",
             ).replace("%s", values_string)
 
             final_query_params = {
@@ -1116,14 +1361,22 @@ def _fetch_latest_activity(
                 final_query_params["min_value"] = actual_min_value
 
             db.execute(final_query_template, final_query_params)
-            results = db.fetchall()
+            results = db.fetchall()[:1000]
         else:
-            final_query_template = LATEST_ACTIVITY_QUERY_V3.replace("%s", values_string)
+            final_query_template = LATEST_ACTIVITY_QUERY_V3.format(
+                order_by_clause=order_by_clause,
+                min_value_filter=min_value_filter,
+                form_type_col=", form_type",
+                form_type_expr="fwp.form_type",
+            ).replace("%s", values_string)
             final_query_params = {
                 "valid_filing_ids": list(valid_filing_ids),
                 "filing_ids_to_process": list(filing_ids_to_process),
                 "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
             }
+            if actual_min_value is not None:
+                final_query_params["min_value"] = actual_min_value
+
             db.execute(final_query_template, final_query_params)
             results = db.fetchall()[:1000]
 
@@ -1131,10 +1384,12 @@ def _fetch_latest_activity(
         for row in results:
             activity_dict = dict(row)
             clean_cusip = activity_dict["cusip"].upper() if activity_dict.get("cusip") else None
+            activity_dict["cusip"] = clean_cusip
             activity_dict["ticker"] = (
                 CUSIP_TO_TICKER.get(clean_cusip)
                 or CUSIP_TO_TICKER.get(activity_dict.get("cusip"))
             )
+            activity_dict["security_type"] = sec_type
             activities.append(HoldingActivity(**activity_dict))
 
         return LatestActivityResponse(
@@ -1158,9 +1413,12 @@ def get_latest_activity_v3(
     offset: int = Query(0, description="Number of *companies* to skip for pagination", ge=0),
     security_type: Optional[str] = Query("stocks", description="Filter by security type: 'stocks' or 'options'"),
     ticker: Optional[str] = Query(None, description="Filter by underlying stock ticker or CUSIP (e.g. AAPL, NVDA)"),
+    cik: Optional[str] = Query(None, description="Filter by company CIK number (e.g. 0001067983)"),
     put_or_call: Optional[str] = Query(None, description="Filter by option contract type ('PUT' or 'CALL')"),
     change_type: Optional[str] = Query(None, description="Filter by trade type ('new', 'closed', 'increased', 'decreased')"),
     min_value: Optional[float] = Query(None, description="Filter by minimum absolute dollar value change", ge=0),
+    sort_by: Optional[str] = Query("filing_date", description="Sort by field: 'filing_date', 'value_change', 'percent_change', 'weight_pct', 'company_name'"),
+    sort_direction: Optional[str] = Query("desc", description="Sort direction: 'asc' or 'desc'"),
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -1174,9 +1432,12 @@ def get_latest_activity_v3(
         offset=offset,
         security_type=security_type or "stocks",
         ticker=ticker,
+        cik=cik,
         put_or_call=put_or_call,
         change_type=change_type,
         min_value=min_value,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
         response=response,
     )
 
@@ -1188,9 +1449,12 @@ def get_latest_options_activity(
     limit: int = Query(10, description="Number of *companies* to fetch options trades for", ge=1, le=50),
     offset: int = Query(0, description="Number of *companies* to skip for pagination", ge=0),
     ticker: Optional[str] = Query(None, description="Filter by underlying stock ticker or CUSIP (e.g. AAPL, NVDA)"),
+    cik: Optional[str] = Query(None, description="Filter by company CIK number (e.g. 0001067983)"),
     put_or_call: Optional[str] = Query(None, description="Filter by option contract type ('PUT' or 'CALL')"),
     change_type: Optional[str] = Query(None, description="Filter by trade type ('new', 'closed', 'increased', 'decreased')"),
     min_value: Optional[float] = Query(None, description="Filter by minimum absolute dollar value change", ge=0),
+    sort_by: Optional[str] = Query("filing_date", description="Sort by field: 'filing_date', 'value_change', 'percent_change', 'weight_pct', 'company_name'"),
+    sort_direction: Optional[str] = Query("desc", description="Sort direction: 'asc' or 'desc'"),
     response: Response = Response(),
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
@@ -1203,8 +1467,11 @@ def get_latest_options_activity(
         offset=offset,
         security_type="options",
         ticker=ticker,
+        cik=cik,
         put_or_call=put_or_call,
         change_type=change_type,
         min_value=min_value,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
         response=response,
     )
