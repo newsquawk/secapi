@@ -352,7 +352,11 @@ def fetch_changes(
         )
 
     values_string = ",\n".join(
-        db.mogrify("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", t).decode("utf-8")
+        db.mogrify(
+            # Explicit casts on the nullable predecessor columns: with a single-row
+            # VALUES a bare NULL is typed text, breaking `filing_id = prev_id`.
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::integer, %s::text)", t
+        ).decode("utf-8")
         for t in filing_tuples
     )
     # The mogrified literals are spliced into a query that is executed AGAIN with
