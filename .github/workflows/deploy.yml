@@ -103,7 +103,7 @@ jobs:
               -e CORS_ORIGINS=https://app.newsquawk.com,http://159.203.94.47:5000 \
               -e ENABLE_DOCS=true \
               -e AUTH_JWKS_URL=https://app.newsquawk.com/auth/realms/Newsquawk/protocol/openid-connect/certs \
-              -e AUTH_SYNC_REALM_ROLE=newsquawk-internal-role \
+              -e AUTH_SYNC_REALM_ROLE=internal-service-account \
               -e AUTH_STUB_MODE=false \
               $IMAGE_NAME
             
