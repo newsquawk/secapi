@@ -65,6 +65,55 @@ class TestChangeCursor(unittest.TestCase):
                 decode_cursor(bad)
 
 
+class _FakeDb:
+    """Minimal psycopg2-cursor stand-in: serves one filing page, records SQL."""
+
+    def __init__(self, page):
+        self.page = page
+        self.queries = []
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self.queries.append(sql)
+        self._rows = self.page if "FROM filings f" in sql else []
+
+    def fetchall(self):
+        return self._rows
+
+    def mogrify(self, template, args):
+        def lit(v):
+            return "NULL" if v is None else "'" + str(v).replace("'", "''") + "'"
+        return (template % tuple(lit(a) for a in args)).encode("utf-8")
+
+
+class TestFetchChangesSinglePage(unittest.TestCase):
+    """Regression: limit=1 on a first-ever filing (no predecessor) returned 500.
+
+    A one-row VALUES list holding a bare NULL previous_filing_id is typed text by
+    Postgres, so `filing_id = fwp.previous_filing_id` raised
+    "operator does not exist: integer = text". The nullable predecessor columns
+    must carry explicit casts so the type never depends on sibling rows.
+    """
+
+    def test_null_predecessor_is_cast_in_values(self):
+        now = datetime(2026, 8, 17, 21, 16, 56, tzinfo=timezone.utc)
+        page = [{
+            "filing_id": 338561, "company_id": 1, "accession_number": "0000000000-26-000001",
+            "period_of_report": "2026-06-30", "filing_date": "2026-08-17",
+            "created_at": now, "updated_at": now, "form_type": "13F-HR",
+            "file_number": None, "filing_directory": None,
+            "company_name": "Acme", "cik_number": "1", "aum": None,
+            "previous_filing_id": None, "previous_accession_number": None,
+        }]
+        db = _FakeDb(page)
+        items, next_cursor, has_more = change_feed.fetch_changes(db, None, 1, 0, "backward")
+
+        self.assertEqual(len(items), 1)
+        self.assertTrue(has_more)
+        activity_sql = db.queries[-1]
+        self.assertIn("NULL::integer, NULL::text)", activity_sql)
+
+
 class TestSyncAuth(unittest.TestCase):
     """Auth policy on the sync endpoints (runs without a token / DB)."""
 
