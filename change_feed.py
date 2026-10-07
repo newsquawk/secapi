@@ -185,13 +185,16 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                 COALESCE(curr.put_or_call, prev.put_or_call) AS put_or_call,
                 COALESCE(curr.shares_type, prev.shares_type) AS shares_type,
                 COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
-                curr.total_value AS current_value,
-                curr.total_shares AS current_shares,
-                prev.total_value AS previous_value,
-                prev.total_shares AS previous_shares,
-                (curr.total_shares - prev.total_shares) AS change_in_share,
+                -- A side with no row is a position of zero, not an unknown: a closed
+                -- position holds 0 now (delta = -previous, percent = -100), a new one held 0
+                -- before (delta = +current; percent stays NULL, divide by zero).
+                COALESCE(curr.total_value, 0) AS current_value,
+                COALESCE(curr.total_shares, 0) AS current_shares,
+                COALESCE(prev.total_value, 0) AS previous_value,
+                COALESCE(prev.total_shares, 0) AS previous_shares,
+                (COALESCE(curr.total_shares, 0) - COALESCE(prev.total_shares, 0)) AS change_in_share,
                 CASE
-                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    WHEN prev.total_shares > 0 THEN ((COALESCE(curr.total_shares, 0) - prev.total_shares)::numeric / prev.total_shares) * 100
                     ELSE NULL
                 END AS percent_change,
                 CASE
@@ -235,16 +238,15 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
-        -- A principal amount is dollars, not shares: value / amount is not a price.
+        -- NULL (not 0) when there is no price: a PRN principal amount is dollars, not
+        -- shares, and a missing/zero share count (new or closed side) has no price.
         ROUND(
-            CASE WHEN hc.shares_type = 'PRN' THEN NULL
-                 WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares
-                 ELSE 0 END, 2
+            CASE WHEN hc.shares_type <> 'PRN' AND hc.current_shares > 0
+                 THEN (hc.current_value::numeric) / hc.current_shares END, 2
         ) AS current_price_per_share,
         ROUND(
-            CASE WHEN hc.shares_type = 'PRN' THEN NULL
-                 WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares
-                 ELSE 0 END, 2
+            CASE WHEN hc.shares_type <> 'PRN' AND hc.previous_shares > 0
+                 THEN (hc.previous_value::numeric) / hc.previous_shares END, 2
         ) AS previous_price_per_share,
         ROUND(
             CASE WHEN hc.aum > 0 AND hc.current_value > 0 THEN (hc.current_value::numeric / hc.aum) * 100 ELSE NULL END, 4

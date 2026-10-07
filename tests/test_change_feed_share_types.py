@@ -37,7 +37,7 @@ CREATE TABLE holdings_normalised (filing_id INT, issuer_id INT, title_of_class I
     put_or_call INT, shares_or_principal_type INT, shares_or_principal_amount BIGINT, value BIGINT);
 
 INSERT INTO companies VALUES (1, 'Acme Capital', '0000000001', 1000000000);
-INSERT INTO issuers VALUES (1, 'ABC123456', 'ABC CORP');
+INSERT INTO issuers VALUES (1, 'ABC123456', 'ABC CORP'), (2, 'XYZ999999', 'XYZ CORP'), (3, 'NEW000001', 'NEW CORP');
 INSERT INTO title_of_class_table VALUES (1, 'COM', TRUE);
 INSERT INTO share_type_table VALUES (1, 'SH'), (2, 'PRN');
 -- previous quarter (filing 1) and latest (filing 2)
@@ -46,6 +46,10 @@ VALUES (1, 1, 'ACC-PREV', '2026-03-31', '2026-05-10', now()),
        (2, 1, 'ACC-LATEST', '2026-06-30', '2026-08-10', now());
 -- previous: 1,000 shares ($100k) + $5,000,000 principal on the same CUSIP
 INSERT INTO holdings_normalised VALUES (1, 1, 1, NULL, 1, 1000, 100000), (1, 1, 1, NULL, 2, 5000000, 5000000);
+-- XYZ is only in the previous quarter (closed) and has no current shares
+INSERT INTO holdings_normalised VALUES (1, 2, 1, NULL, 1, 200, 10000);
+-- NEW is only in the latest quarter (new position)
+INSERT INTO holdings_normalised VALUES (2, 3, 1, NULL, 1, 300, 30000);
 -- latest: 1,500 shares ($150k) + $2,000,000 principal
 INSERT INTO holdings_normalised VALUES (2, 1, 1, NULL, 1, 1500, 150000), (2, 1, 1, NULL, 2, 2000000, 2000000);
 """
@@ -71,29 +75,55 @@ class TestChangeFeedShareTypes(unittest.TestCase):
         cur = self.conn.cursor(cursor_factory=RealDictCursor)
         items, _, _ = change_feed.fetch_changes(cur, None, 1, 0, "backward")
         self.assertEqual(items[0].accession_number, "ACC-LATEST")
-        return {a.shares_or_principal_type: a for a in items[0].activities}
+        return {(a.cusip, a.shares_or_principal_type): a for a in items[0].activities}
 
     def test_sh_and_prn_are_separate_rows(self):
         acts = self._activities()
-        self.assertEqual(set(acts), {"SH", "PRN"})
+        self.assertEqual({k for k in acts if k[0] == "ABC123456"},
+                         {("ABC123456", "SH"), ("ABC123456", "PRN")})
 
     def test_units_are_not_summed_or_diffed_together(self):
         acts = self._activities()
         self.assertEqual(
-            (acts["SH"].current_shares, acts["SH"].previous_shares, acts["SH"].change_type),
+            (acts[("ABC123456", "SH")].current_shares, acts[("ABC123456", "SH")].previous_shares, acts[("ABC123456", "SH")].change_type),
             (1500, 1000, "increased"),
         )
         self.assertEqual(
-            (acts["PRN"].current_shares, acts["PRN"].previous_shares, acts["PRN"].change_type),
+            (acts[("ABC123456", "PRN")].current_shares, acts[("ABC123456", "PRN")].previous_shares, acts[("ABC123456", "PRN")].change_type),
             (2000000, 5000000, "decreased"),
         )
 
     def test_prn_has_no_price_per_share(self):
         acts = self._activities()
-        self.assertEqual(acts["SH"].current_price_per_share, 100.0)
-        self.assertIsNone(acts["PRN"].current_price_per_share)
-        self.assertIsNone(acts["PRN"].previous_price_per_share)
+        self.assertEqual(acts[("ABC123456", "SH")].current_price_per_share, 100.0)
+        self.assertIsNone(acts[("ABC123456", "PRN")].current_price_per_share)
+        self.assertIsNone(acts[("ABC123456", "PRN")].previous_price_per_share)
 
+    def test_missing_side_price_is_null_not_zero(self):
+        closed = self._activities()[("XYZ999999", "SH")]
+        self.assertIsNone(closed.current_price_per_share)  # no current shares
+        self.assertEqual(closed.previous_price_per_share, 50.0)
+
+    def test_closed_position_is_zero_with_negative_delta(self):
+        closed = self._activities()[("XYZ999999", "SH")]
+        self.assertEqual(closed.change_type, "closed")
+        self.assertEqual((closed.current_shares, closed.current_value), (0, 0))
+        self.assertEqual((closed.previous_shares, closed.previous_value), (200, 10000))
+        self.assertEqual(closed.change_in_share, -200)
+        self.assertEqual(closed.percent_change, -100.0)
+        self.assertEqual(closed.absolute_value_change, 10000)
+        self.assertEqual(closed.value_pct, -100.0)
+        self.assertIsNone(closed.weight_pct)
+
+    def test_new_position_has_zero_previous_and_no_percent(self):
+        new = self._activities()[("NEW000001", "SH")]
+        self.assertEqual(new.change_type, "new")
+        self.assertEqual((new.previous_shares, new.previous_value), (0, 0))
+        self.assertEqual(new.change_in_share, 300)
+        self.assertIsNone(new.percent_change)
+        self.assertIsNone(new.value_pct)
+        self.assertIsNone(new.previous_price_per_share)
+        self.assertEqual(new.current_price_per_share, 100.0)
 
 if __name__ == "__main__":
     unittest.main()
