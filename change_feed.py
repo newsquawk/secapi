@@ -134,6 +134,10 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             SUM(h.value) AS total_value,
             SUM(h.shares_or_principal_amount) AS total_shares,
             tc.is_common_stock,
+            -- SH = share count, PRN = principal amount in dollars. The two units
+            -- must never be summed or diffed together, so they aggregate (and
+            -- join across quarters) separately. NULL/unknown defaults to SH.
+            CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END AS shares_type,
             -- Normalise put_or_call: the source dictionary holds duplicate case
             -- variants (PUT/CALL and Put/Call). Uppercasing collapses them so a
             -- filing labelled 'Call' does not diff against a predecessor's 'CALL'
@@ -144,8 +148,10 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
+        LEFT JOIN share_type_table st ON h.shares_or_principal_type = st.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
-        GROUP BY h.filing_id, i.cusip, tc.is_common_stock, upper(poc.name)
+        GROUP BY h.filing_id, i.cusip, tc.is_common_stock, upper(poc.name),
+                 CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END
     ),
     HoldingsComparison AS (
         SELECT
@@ -161,6 +167,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
             hc.cusip,
             hc.put_or_call,
+            hc.shares_type,
             hc.issuer_name,
             hc.current_value,
             hc.current_shares,
@@ -176,6 +183,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,
                 COALESCE(curr.put_or_call, prev.put_or_call) AS put_or_call,
+                COALESCE(curr.shares_type, prev.shares_type) AS shares_type,
                 COALESCE(curr.issuer_name, prev.issuer_name) AS issuer_name,
                 curr.total_value AS current_value,
                 curr.total_shares AS current_shares,
@@ -201,6 +209,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                 ON curr.cusip = prev.cusip
                AND curr.is_common_stock = prev.is_common_stock
                AND curr.put_or_call IS NOT DISTINCT FROM prev.put_or_call
+               AND curr.shares_type = prev.shares_type
             WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
     )
@@ -215,6 +224,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.issuer_name,
         hc.cusip,
         hc.put_or_call,
+        hc.shares_type AS shares_or_principal_type,
         hc.is_common_stock,
         hc.change_type,
         hc.current_shares,
@@ -225,11 +235,16 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
+        -- A principal amount is dollars, not shares: value / amount is not a price.
         ROUND(
-            CASE WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares ELSE 0 END, 2
+            CASE WHEN hc.shares_type = 'PRN' THEN NULL
+                 WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares
+                 ELSE 0 END, 2
         ) AS current_price_per_share,
         ROUND(
-            CASE WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares ELSE 0 END, 2
+            CASE WHEN hc.shares_type = 'PRN' THEN NULL
+                 WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares
+                 ELSE 0 END, 2
         ) AS previous_price_per_share,
         ROUND(
             CASE WHEN hc.aum > 0 AND hc.current_value > 0 THEN (hc.current_value::numeric / hc.aum) * 100 ELSE NULL END, 4

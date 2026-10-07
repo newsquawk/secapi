@@ -55,6 +55,9 @@ class HoldingActivity(BaseModel):
     ticker: Optional[str] = None
     is_common_stock: bool
     put_or_call: Optional[str] = None
+    # 'SH' (share count) or 'PRN' (principal amount in dollars); the *_shares
+    # fields below hold that unit, and price_per_share is null for PRN.
+    shares_or_principal_type: Optional[str] = None
 
     # Change Info
     change_type: str  # 'new', 'closed', 'increased', 'decreased'
