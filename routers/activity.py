@@ -287,16 +287,18 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
                 curr.total_shares AS current_shares,
                 prev.total_value AS previous_value,
                 prev.total_shares AS previous_shares,
-                (curr.total_shares - prev.total_shares) AS change_in_share,
+                ss.split_factor,
+                (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) AS change_in_share,
                 CASE
-                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    WHEN prev.total_shares > 0 THEN 
+                        ((COALESCE(curr.total_shares, 0) - (prev.total_shares * COALESCE(ss.split_factor, 1.0)))::numeric / (prev.total_shares * COALESCE(ss.split_factor, 1.0))) * 100
                     ELSE NULL
                 END AS percent_change,
                 CASE
                     WHEN prev.cusip IS NULL THEN 'new'
                     WHEN curr.cusip IS NULL THEN 'closed'
-                    WHEN curr.total_shares > prev.total_shares THEN 'increased'
-                    WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                    WHEN curr.total_shares > ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
+                    WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
                 END as change_type,
                 COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
@@ -305,6 +307,9 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             FULL OUTER JOIN
                 (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.previous_filing_id) AS prev
             ON curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+            LEFT JOIN stock_splits ss
+                ON COALESCE(curr.cusip, prev.cusip) = ss.cusip
+               AND fwp.period_of_report = ss.period_of_report
             WHERE
                 (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
@@ -455,7 +460,8 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             hc.change_in_share,
             hc.percent_change,
             hc.change_type,
-            hc.is_common_stock
+            hc.is_common_stock,
+            hc.split_factor
         FROM
             FilingsWithPrevious fwp
         LEFT JOIN LATERAL (
@@ -466,16 +472,18 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
                 curr.total_shares AS current_shares,
                 prev.total_value AS previous_value,
                 prev.total_shares AS previous_shares,
-                (curr.total_shares - prev.total_shares) AS change_in_share,
+                ss.split_factor,
+                (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) AS change_in_share,
                 CASE
-                    WHEN prev.total_shares > 0 THEN ((curr.total_shares - prev.total_shares)::numeric / prev.total_shares) * 100
+                    WHEN prev.total_shares > 0 THEN 
+                        ((COALESCE(curr.total_shares, 0) - (prev.total_shares * COALESCE(ss.split_factor, 1.0)))::numeric / (prev.total_shares * COALESCE(ss.split_factor, 1.0))) * 100
                     ELSE NULL
                 END AS percent_change,
                 CASE
                     WHEN prev.cusip IS NULL THEN 'new'
                     WHEN curr.cusip IS NULL THEN 'closed'
-                    WHEN curr.total_shares > prev.total_shares THEN 'increased'
-                    WHEN curr.total_shares < prev.total_shares THEN 'decreased'
+                    WHEN curr.total_shares > ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
+                    WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
                 END as change_type,
                 COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
@@ -484,6 +492,9 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             FULL OUTER JOIN
                 (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.previous_filing_id) AS prev
                 ON curr.cusip = prev.cusip AND curr.is_common_stock = prev.is_common_stock
+            LEFT JOIN stock_splits ss
+                ON COALESCE(curr.cusip, prev.cusip) = ss.cusip
+               AND fwp.period_of_report = ss.period_of_report
             WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
         WHERE
@@ -505,6 +516,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         hc.previous_shares,
         hc.change_in_share,
         ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.split_factor,
         hc.current_value,
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
@@ -517,7 +529,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         ) AS current_price_per_share,
         ROUND(
             CASE
-                WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / hc.previous_shares
+                WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / (hc.previous_shares * COALESCE(hc.split_factor, 1.0))
                 ELSE 0
             END, 2
         ) AS previous_price_per_share,

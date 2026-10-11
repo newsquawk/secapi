@@ -66,6 +66,7 @@ class HoldingActivity(BaseModel):
     previous_shares: Optional[int] = None
     change_in_share: Optional[int] = None
     percent_change: Optional[float] = None
+    split_factor: Optional[float] = None
 
     # Value Info
     current_value: Optional[int] = None
