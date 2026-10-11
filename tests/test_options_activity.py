@@ -323,7 +323,40 @@ class TestOptionsActivity(unittest.TestCase):
         for act in r_stock.json().get("activities", []):
             self.assertEqual(act.get("security_type"), "stocks")
 
+    def test_option_contracts_normalisation_ctc_nvda(self):
+        """
+        Issue 1: CTC LLC mistakenly reported option contracts instead of underlying shares.
+        holdings_normalised must multiply by 100, returning 22,157,200 shares (~$200.09/sh),
+        NOT the raw 221,572 contracts (~$20,009/sh).
+        """
+        r = self.client.get("/activity/latest/options?cik=1445893&ticker=NVDA")
+        self.assertEqual(r.status_code, 200)
+        acts = r.json().get("activities", [])
+        self.assertGreaterEqual(len(acts), 1)
+        for act in acts:
+            self.assertEqual(act["cusip"], "67066G104")
+            # Shares must be normalized (underlying shares > 10M, not raw ~200k contracts)
+            self.assertGreater(act["current_shares"], 10_000_000)
+            implied_price = act["current_value"] / act["current_shares"]
+            self.assertAlmostEqual(implied_price, 200.09, delta=1.0)
+
+    def test_option_contracts_normalisation_ctc_aapl(self):
+        """
+        Issue 1: CTC LLC on AAPL options must be normalized to ~$289.36/share,
+        not ~$28,936/share.
+        """
+        r = self.client.get("/activity/latest/options?cik=1445893&ticker=AAPL")
+        self.assertEqual(r.status_code, 200)
+        acts = r.json().get("activities", [])
+        self.assertGreaterEqual(len(acts), 1)
+        for act in acts:
+            self.assertEqual(act["cusip"], "037833100")
+            self.assertGreater(act["current_shares"], 5_000_000)
+            implied_price = act["current_value"] / act["current_shares"]
+            self.assertAlmostEqual(implied_price, 289.36, delta=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
