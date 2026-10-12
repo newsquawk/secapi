@@ -273,6 +273,16 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
           AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
         GROUP BY h.filing_id, i.cusip, tc.is_common_stock
     ),
+    FilingTotals AS (
+        SELECT 
+            h.filing_id, 
+            SUM(CASE WHEN f.filing_date < '2023-01-03' THEN h.value * 1000 ELSE h.value END) AS filing_total_value
+        FROM holdings h
+        JOIN filings f ON h.filing_id = f.filing_id
+        WHERE h.filing_id = ANY(%(valid_filing_ids)s)
+          AND f.filing_id = ANY(%(valid_filing_ids)s)
+        GROUP BY h.filing_id
+    ),
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
@@ -329,7 +339,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
     )
     SELECT
         fwp.cik_number AS cik,
-        fwp.aum,
+        COALESCE(ft.filing_total_value, fwp.aum) AS aum,
         fwp.accession_number AS latest_accession_number,
         fwp.previous_accession_number,
         fwp.company_name,
@@ -406,9 +416,11 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
     FROM
         FilingsWithPrevious fwp
     LEFT JOIN
+        FilingTotals ft ON fwp.filing_id = ft.filing_id
+    LEFT JOIN
         RankedChanges rc ON fwp.filing_id = rc.filing_id
     GROUP BY
-        fwp.filing_id, fwp.cik_number, fwp.aum, fwp.accession_number, fwp.previous_accession_number,
+        fwp.filing_id, fwp.cik_number, fwp.aum, ft.filing_total_value, fwp.accession_number, fwp.previous_accession_number,
         fwp.company_name, fwp.period_of_report, fwp.filing_date, fwp.created_at
     ORDER BY
         fwp.filing_date DESC, fwp.created_at DESC;
@@ -439,10 +451,20 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
           AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
         GROUP BY h.filing_id, i.cusip, tc.is_common_stock
     ),
+    FilingTotals AS (
+        SELECT 
+            h.filing_id, 
+            SUM(CASE WHEN f.filing_date < '2023-01-03' THEN h.value * 1000 ELSE h.value END) AS filing_total_value
+        FROM holdings h
+        JOIN filings f ON h.filing_id = f.filing_id
+        WHERE h.filing_id = ANY(%(valid_filing_ids)s)
+          AND f.filing_id = ANY(%(valid_filing_ids)s)
+        GROUP BY h.filing_id
+    ),
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            fwp.aum,
+            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -464,6 +486,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             hc.split_factor
         FROM
             FilingsWithPrevious fwp
+        LEFT JOIN FilingTotals ft ON fwp.filing_id = ft.filing_id
         LEFT JOIN LATERAL (
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,
@@ -654,10 +677,20 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
           {cusip_filter}
         GROUP BY h.filing_id, UPPER(i.cusip), UPPER(p.name)
     ),
+    FilingTotals AS (
+        SELECT 
+            h.filing_id, 
+            SUM(CASE WHEN f.filing_date < '2023-01-03' THEN h.value * 1000 ELSE h.value END) AS filing_total_value
+        FROM holdings h
+        JOIN filings f ON h.filing_id = f.filing_id
+        WHERE h.filing_id = ANY(%(valid_filing_ids)s)
+          AND f.filing_id = ANY(%(valid_filing_ids)s)
+        GROUP BY h.filing_id
+    ),
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            fwp.aum,
+            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -678,6 +711,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
             hc.change_type
         FROM
             FilingsWithPrevious fwp
+        LEFT JOIN FilingTotals ft ON fwp.filing_id = ft.filing_id
         LEFT JOIN LATERAL (
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,

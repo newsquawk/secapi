@@ -153,10 +153,17 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         GROUP BY h.filing_id, i.cusip, tc.is_common_stock, upper(poc.name),
                  CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END
     ),
+    FilingTotals AS (
+        SELECT
+            filing_id,
+            SUM(total_value) AS filing_total_value
+        FROM AggregatedHoldings
+        GROUP BY filing_id
+    ),
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            fwp.aum,
+            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -176,9 +183,11 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             hc.change_in_share,
             hc.percent_change,
             hc.change_type,
-            hc.is_common_stock
+            hc.is_common_stock,
+            hc.split_factor
         FROM
             FilingsWithPrevious fwp
+        LEFT JOIN FilingTotals ft ON fwp.filing_id = ft.filing_id
         LEFT JOIN LATERAL (
             SELECT
                 COALESCE(curr.cusip, prev.cusip) AS cusip,
@@ -402,6 +411,8 @@ def fetch_changes(
         acc = row["latest_accession_number"]
         env = envelopes.get(acc)
         if env is not None:
+            if row.get("aum") is not None:
+                env.aum = row["aum"]
             d = dict(row)
             d["ticker"] = CUSIP_TO_TICKER.get(d["cusip"])
             env.activities.append(HoldingActivity(**d))
