@@ -89,46 +89,58 @@ def detect_splits_for_period(conn, curr_period: str, prev_period: str, min_holde
     t0 = time.perf_counter()
 
     query = """
-    WITH HolderPairs AS (
+    WITH CurrHoldings AS (
         SELECT 
-            f_curr.company_id,
-            UPPER(i.cusip) AS cusip,
-            MIN(i.issuer_name) AS issuer_name,
-            SUM(h_prev.shares_or_principal_amount) AS prev_shares,
-            SUM(h_prev.value) AS prev_value,
-            SUM(h_curr.shares_or_principal_amount) AS curr_shares,
-            SUM(h_curr.value) AS curr_value,
-            -- Share ratio (curr / prev)
-            (SUM(h_curr.shares_or_principal_amount)::numeric / NULLIF(SUM(h_prev.shares_or_principal_amount), 0)) AS share_ratio,
-            -- Price ratio (prev_price / curr_price)
-            ((SUM(h_prev.value)::numeric / NULLIF(SUM(h_prev.shares_or_principal_amount), 0)) / 
-             NULLIF((SUM(h_curr.value)::numeric / NULLIF(SUM(h_curr.shares_or_principal_amount), 0)), 0)) AS price_ratio
-        FROM filings f_curr
-        JOIN filings f_prev ON f_curr.company_id = f_prev.company_id 
-                            AND f_prev.period_of_report = %(prev_period)s::date
-                            AND f_prev.form_type IN ('13F-HR', '13F-HR/A')
-        JOIN holdings h_curr ON f_curr.filing_id = h_curr.filing_id
-        JOIN holdings h_prev ON f_prev.filing_id = h_prev.filing_id AND h_curr.issuer_id = h_prev.issuer_id
-        JOIN issuers i ON h_curr.issuer_id = i.issuer_id
-        JOIN title_of_class_table tc ON h_curr.title_of_class = tc.id AND tc.is_common_stock = true
-        WHERE f_curr.period_of_report = %(curr_period)s::date
-          AND f_curr.form_type IN ('13F-HR', '13F-HR/A')
-          AND h_curr.put_or_call = 1 AND h_prev.put_or_call = 1
-          AND (h_curr.shares_or_principal_type IS NULL OR h_curr.shares_or_principal_type = 1)
-          AND (h_prev.shares_or_principal_type IS NULL OR h_prev.shares_or_principal_type = 1)
-          AND h_curr.shares_or_principal_amount > 0 AND h_prev.shares_or_principal_amount > 0
-          AND h_curr.value > 0 AND h_prev.value > 0
-        GROUP BY f_curr.company_id, UPPER(i.cusip)
+            f.company_id,
+            h.issuer_id,
+            SUM(h.shares_or_principal_amount) AS curr_shares,
+            SUM(h.value) AS curr_value
+        FROM filings f
+        JOIN holdings h ON f.filing_id = h.filing_id
+        JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        WHERE f.period_of_report = %(curr_period)s::date
+          AND f.form_type IN ('13F-HR', '13F-HR/A')
+          AND h.put_or_call = 1
+          AND tc.is_common_stock = true
+          AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
+          AND h.shares_or_principal_amount > 0 AND h.value > 0
+        GROUP BY f.company_id, h.issuer_id
+    ),
+    PrevHoldings AS (
+        SELECT 
+            f.company_id,
+            h.issuer_id,
+            SUM(h.shares_or_principal_amount) AS prev_shares,
+            SUM(h.value) AS prev_value
+        FROM filings f
+        JOIN holdings h ON f.filing_id = h.filing_id
+        JOIN title_of_class_table tc ON h.title_of_class = tc.id
+        WHERE f.period_of_report = %(prev_period)s::date
+          AND f.form_type IN ('13F-HR', '13F-HR/A')
+          AND h.put_or_call = 1
+          AND tc.is_common_stock = true
+          AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
+          AND h.shares_or_principal_amount > 0 AND h.value > 0
+        GROUP BY f.company_id, h.issuer_id
+    ),
+    Pairs AS (
+        SELECT 
+            c.issuer_id,
+            (c.curr_shares::numeric / p.prev_shares) AS share_ratio,
+            ((p.prev_value::numeric / p.prev_shares) / NULLIF((c.curr_value::numeric / c.curr_shares), 0)) AS price_ratio
+        FROM CurrHoldings c
+        JOIN PrevHoldings p ON c.company_id = p.company_id AND c.issuer_id = p.issuer_id
     ),
     CusipSummary AS (
         SELECT 
-            cusip,
-            MIN(issuer_name) AS issuer_name,
+            UPPER(i.cusip) AS cusip,
+            MIN(i.issuer_name) AS issuer_name,
             count(*) AS holder_count,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY share_ratio)::numeric AS median_share_ratio,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY price_ratio)::numeric AS median_price_ratio
-        FROM HolderPairs
-        GROUP BY cusip
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY pr.share_ratio)::numeric AS median_share_ratio,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY pr.price_ratio)::numeric AS median_price_ratio
+        FROM Pairs pr
+        JOIN issuers i ON pr.issuer_id = i.issuer_id
+        GROUP BY UPPER(i.cusip)
         HAVING count(*) >= %(min_holders)s
     )
     SELECT 
@@ -144,6 +156,7 @@ def detect_splits_for_period(conn, curr_period: str, prev_period: str, min_holde
     """
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SET statement_timeout = '300s';")
         cur.execute(query, {"curr_period": curr_period, "prev_period": prev_period, "min_holders": min_holders})
         candidates = cur.fetchall()
 
