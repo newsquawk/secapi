@@ -130,5 +130,9 @@ jobs:
             echo "Running automated test suite inside container..."
             docker exec secapi_container python -m unittest discover tests -v
 
-            # 7. Clean up old unused images
+            # 7. Refresh dependent web frontend connection pool
+            echo "Restarting secweb_container to refresh connections..."
+            docker restart secweb_container || true
+
+            # 8. Clean up old unused images
             docker image prune -f
