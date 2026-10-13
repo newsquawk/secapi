@@ -160,7 +160,8 @@ def _query_filings(
         "filing_date": "f.filing_date",
         "period_of_report": "f.period_of_report",
         "created_at": "f.created_at",
-        "aum": "c.aum",
+        "aum": "COALESCE(f.reported_value_total, c.aum)",
+        "reported_value_total": "COALESCE(f.reported_value_total, c.aum)",
     }
 
     if sort_by not in allowed_sort_columns:
@@ -182,11 +183,11 @@ def _query_filings(
         params["company_id"] = company_id
 
     if min_aum is not None:
-        where_clauses.append("c.aum >= %(min_aum)s")
+        where_clauses.append("COALESCE(f.reported_value_total, c.aum) >= %(min_aum)s")
         params["min_aum"] = min_aum
 
     if max_aum is not None:
-        where_clauses.append("c.aum <= %(max_aum)s")
+        where_clauses.append("COALESCE(f.reported_value_total, c.aum) <= %(max_aum)s")
         params["max_aum"] = max_aum
 
     if ciks:
@@ -211,7 +212,9 @@ def _query_filings(
             SELECT
                 lf.accession_number, lf.form_type, lf.filing_date, lf.period_of_report,
                 lf.file_number, lf.filing_directory, lf.created_at, lf.updated_at,
-                c.company_name, c.cik_number, c.aum
+                c.company_name, c.cik_number,
+                COALESCE(lf.reported_value_total, c.aum) AS aum,
+                lf.reported_value_total
             FROM (
                 SELECT company_id, company_name, cik_number, aum
                 FROM companies c
@@ -221,7 +224,8 @@ def _query_filings(
             ) c
             CROSS JOIN LATERAL (
                 SELECT f.accession_number, f.form_type, f.filing_date, f.period_of_report,
-                       f.file_number, f.filing_directory, f.created_at, f.updated_at
+                       f.file_number, f.filing_directory, f.created_at, f.updated_at,
+                       f.reported_value_total
                 FROM filings f
                 WHERE f.company_id = c.company_id
                 ORDER BY f.filing_date DESC, f.accession_number DESC
@@ -268,7 +272,8 @@ def _query_filings(
                 f.updated_at,
                 c.company_name,
                 c.cik_number,
-                c.aum
+                COALESCE(f.reported_value_total, c.aum) AS aum,
+                f.reported_value_total
             FROM filings f
             LEFT JOIN companies c ON f.company_id = c.company_id
             WHERE {where_sql}
@@ -585,7 +590,9 @@ def get_filing_by_accession_number(
                 f.created_at,
                 f.updated_at,
                 c.company_name,
-                c.cik_number
+                c.cik_number,
+                COALESCE(f.reported_value_total, c.aum) AS aum,
+                f.reported_value_total
             FROM filings f
             LEFT JOIN companies c ON f.company_id = c.company_id
             WHERE f.accession_number = %s

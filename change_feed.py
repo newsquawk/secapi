@@ -92,7 +92,8 @@ FILING_PAGE_QUERY = """
         f.filing_directory,
         c.company_name,
         c.cik_number,
-        c.aum,
+        COALESCE(f.reported_value_total, c.aum) AS aum,
+        f.reported_value_total,
         pf.filing_id AS previous_filing_id,
         pf.accession_number AS previous_accession_number
     FROM filings f
@@ -273,6 +274,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
+        hc.aum AS reported_value_total,
         -- NULL (not 0) when there is no price: a PRN principal amount is dollars, not
         -- shares, and a missing/zero share count (new or closed side) has no price.
         ROUND(
@@ -376,6 +378,7 @@ def fetch_changes(
             filing_date=f["filing_date"],
             period_of_report=f["period_of_report"],
             aum=int(f["aum"]) if f.get("aum") is not None else None,
+            reported_value_total=int(f["reported_value_total"]) if f.get("reported_value_total") is not None else None,
             file_number=f["file_number"],
             filing_directory=f["filing_directory"],
             created_at=f["created_at"],

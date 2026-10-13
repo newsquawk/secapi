@@ -603,6 +603,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
+        hc.aum AS reported_value_total,
         ROUND(
             CASE
                 WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares
@@ -827,6 +828,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
         hc.aum,
+        hc.aum AS reported_value_total,
         ROUND(
             CASE
                 WHEN hc.current_shares > 0 THEN (hc.current_value::numeric) / hc.current_shares
@@ -1519,6 +1521,8 @@ def _fetch_latest_activity(
                 or CUSIP_TO_TICKER.get(activity_dict.get("cusip"))
             )
             activity_dict["security_type"] = sec_type
+            if "reported_value_total" not in activity_dict or activity_dict["reported_value_total"] is None:
+                activity_dict["reported_value_total"] = activity_dict.get("aum")
             activities.append(HoldingActivity(**activity_dict))
 
         return LatestActivityResponse(

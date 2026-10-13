@@ -16,6 +16,7 @@ class Filing(BaseModel):
     filing_directory: Optional[str] = None
     created_at: dt.datetime
     updated_at: dt.datetime
+    reported_value_total: Optional[int] = None
 
 
 class Holding(BaseModel):
@@ -42,6 +43,7 @@ class HoldingActivity(BaseModel):
     cik: str
     company_name: str
     aum: Optional[int] = None
+    reported_value_total: Optional[int] = None
 
     # Filing Info
     latest_accession_number: str
@@ -184,6 +186,7 @@ class FilingEnvelope(BaseModel):
     filing_date: dt.date
     period_of_report: dt.date
     aum: Optional[int] = None
+    reported_value_total: Optional[int] = None
     # Filing-level metadata (lets Content Hub reproduce the Filings list widget).
     file_number: Optional[str] = None
     filing_directory: Optional[str] = None
@@ -262,6 +265,7 @@ class FilingListItem(BaseModel):
     company_name: Optional[str] = None
     cik_number: Optional[str] = None
     aum: Optional[int] = None
+    reported_value_total: Optional[int] = None
 
 
 class FilingsSorting(BaseModel):
@@ -286,6 +290,8 @@ class FilingDetail(BaseModel):
     updated_at: Optional[dt.datetime] = None
     company_name: Optional[str] = None
     cik_number: Optional[str] = None
+    aum: Optional[int] = None
+    reported_value_total: Optional[int] = None
 
 
 class FilingsByAumResponse(BaseModel):
