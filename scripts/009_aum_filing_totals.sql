@@ -18,9 +18,12 @@
 -- Solution:
 -- 1. Ensure `reported_value_total` and `reported_entry_total` columns exist on `filings`.
 -- 2. Add performance index on `filings (reported_value_total)`.
--- 3. Repair legacy pre-2023 companies stored in thousands.
+-- 3. Repair legacy pre-2023 companies stored in thousands (sub-second indexed query).
 -- 4. Restore companies corrupted by small partial amendments back to the base filing total.
 -- ============================================================================
+
+-- Disable statement timeout for the duration of this migration
+SET statement_timeout = 0;
 
 -- Step 1: Ensure columns exist on `filings`
 ALTER TABLE filings ADD COLUMN IF NOT EXISTS reported_value_total BIGINT;
@@ -31,17 +34,25 @@ CREATE INDEX IF NOT EXISTS idx_filings_reported_value_total
     ON filings (reported_value_total);
 
 -- Step 3: Repair pre-2023 companies whose latest filing had aum stored in thousands ($1,000s)
-WITH Pre2023Companies AS (
-    SELECT company_id
-    FROM filings
-    GROUP BY company_id
-    HAVING MAX(filing_date) < '2023-01-01'
+WITH Pre2023Candidates AS (
+    SELECT c.company_id
+    FROM companies c
+    WHERE c.aum > 0
+      AND NOT EXISTS (
+          SELECT 1 FROM filings f
+          WHERE f.company_id = c.company_id
+            AND f.filing_date >= '2023-01-01'
+      )
+      AND EXISTS (
+          SELECT 1 FROM filings f
+          WHERE f.company_id = c.company_id
+      )
 ),
 LatestFilings AS (
     SELECT DISTINCT ON (f.company_id)
         f.company_id, f.filing_id
     FROM filings f
-    JOIN Pre2023Companies p ON f.company_id = p.company_id
+    JOIN Pre2023Candidates p ON f.company_id = p.company_id
     ORDER BY f.company_id, f.filing_date DESC, f.filing_id DESC
 ),
 NormSums AS (
@@ -65,12 +76,18 @@ WITH LatestFiling AS (
     FROM filings
     ORDER BY company_id, filing_date DESC, filing_id DESC
 ),
+AmendedCandidates AS (
+    SELECT lf.filing_id, lf.company_id, lf.period_of_report
+    FROM LatestFiling lf
+    WHERE lf.form_type LIKE '%/A%'
+      AND (SELECT COUNT(*) FROM holdings WHERE filing_id = lf.filing_id) < 10
+),
 BaseFilingSamePeriod AS (
     SELECT DISTINCT ON (f.company_id)
-        f.company_id, f.filing_id, f.form_type, f.filing_date, f.period_of_report
+        f.company_id, f.filing_id, f.filing_date
     FROM filings f
-    JOIN LatestFiling lf ON f.company_id = lf.company_id
-    WHERE f.period_of_report = lf.period_of_report
+    JOIN AmendedCandidates ac ON f.company_id = ac.company_id
+    WHERE f.period_of_report = ac.period_of_report
       AND f.form_type = '13F-HR'
     ORDER BY f.company_id, f.filing_date DESC, f.filing_id DESC
 ),
@@ -85,9 +102,6 @@ BaseHoldingSums AS (
 )
 UPDATE companies c
 SET aum = bhs.base_portfolio_val
-FROM LatestFiling lf
-JOIN BaseHoldingSums bhs ON lf.company_id = bhs.company_id
-WHERE c.company_id = lf.company_id
-  AND lf.form_type LIKE '%/A%'
-  AND (SELECT COUNT(*) FROM holdings WHERE filing_id = lf.filing_id) < 10
+FROM BaseHoldingSums bhs
+WHERE c.company_id = bhs.company_id
   AND bhs.base_portfolio_val > c.aum * 2;

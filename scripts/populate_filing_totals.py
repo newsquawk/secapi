@@ -39,7 +39,11 @@ from config import logger
 
 
 def get_connection():
-    return psycopg2.connect(**_get_db_connection_params())
+    conn = psycopg2.connect(**_get_db_connection_params())
+    with conn.cursor() as cur:
+        cur.execute("SET statement_timeout = 0;")
+    conn.commit()
+    return conn
 
 
 def repair_companies(conn) -> None:
@@ -49,6 +53,7 @@ def repair_companies(conn) -> None:
     print("=" * 70)
 
     cur = conn.cursor()
+    cur.execute("SET statement_timeout = 0;")
 
     # 1. Partial amendments (13F-HR/A)
     t0 = time.time()
@@ -59,12 +64,18 @@ def repair_companies(conn) -> None:
             FROM filings
             ORDER BY company_id, filing_date DESC, filing_id DESC
         ),
+        AmendedCandidates AS (
+            SELECT lf.filing_id, lf.company_id, lf.period_of_report
+            FROM LatestFiling lf
+            WHERE lf.form_type LIKE '%/A%'
+              AND (SELECT COUNT(*) FROM holdings WHERE filing_id = lf.filing_id) < 10
+        ),
         BaseFilingSamePeriod AS (
             SELECT DISTINCT ON (f.company_id)
-                f.company_id, f.filing_id, f.form_type, f.filing_date, f.period_of_report
+                f.company_id, f.filing_id, f.filing_date
             FROM filings f
-            JOIN LatestFiling lf ON f.company_id = lf.company_id
-            WHERE f.period_of_report = lf.period_of_report
+            JOIN AmendedCandidates ac ON f.company_id = ac.company_id
+            WHERE f.period_of_report = ac.period_of_report
               AND f.form_type = '13F-HR'
             ORDER BY f.company_id, f.filing_date DESC, f.filing_id DESC
         ),
@@ -79,11 +90,8 @@ def repair_companies(conn) -> None:
         )
         UPDATE companies c
         SET aum = bhs.base_portfolio_val
-        FROM LatestFiling lf
-        JOIN BaseHoldingSums bhs ON lf.company_id = bhs.company_id
-        WHERE c.company_id = lf.company_id
-          AND lf.form_type LIKE '%/A%'
-          AND (SELECT COUNT(*) FROM holdings WHERE filing_id = lf.filing_id) < 10
+        FROM BaseHoldingSums bhs
+        WHERE c.company_id = bhs.company_id
           AND bhs.base_portfolio_val > c.aum * 2
         RETURNING c.company_name, c.aum;
     """)
@@ -96,17 +104,25 @@ def repair_companies(conn) -> None:
     # 2. Pre-2023 companies stored in thousands
     t0 = time.time()
     cur.execute("""
-        WITH Pre2023Companies AS (
-            SELECT company_id
-            FROM filings
-            GROUP BY company_id
-            HAVING MAX(filing_date) < '2023-01-01'
+        WITH Pre2023Candidates AS (
+            SELECT c.company_id
+            FROM companies c
+            WHERE c.aum > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM filings f
+                  WHERE f.company_id = c.company_id
+                    AND f.filing_date >= '2023-01-01'
+              )
+              AND EXISTS (
+                  SELECT 1 FROM filings f
+                  WHERE f.company_id = c.company_id
+              )
         ),
         LatestFilings AS (
             SELECT DISTINCT ON (f.company_id)
                 f.company_id, f.filing_id
             FROM filings f
-            JOIN Pre2023Companies p ON f.company_id = p.company_id
+            JOIN Pre2023Candidates p ON f.company_id = p.company_id
             ORDER BY f.company_id, f.filing_date DESC, f.filing_id DESC
         ),
         NormSums AS (
