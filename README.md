@@ -483,6 +483,7 @@ Create a `.env` file or export the following environment variables:
 | `AI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint (`https://api.deepseek.com` for direct DeepSeek) |
 | `AI_MODEL` | `deepseek/deepseek-v4.1-flash` | Model ID (`deepseek-chat` for direct DeepSeek, or any model ID) |
 | `RATE_LIMIT` | `120/minute` | Default per-client rate limit |
+| `AI_SUMMARY_RATE_LIMIT` | `20/minute` | Dedicated per-client rate limit for `/api/ai_summary` |
 | `CORS_ORIGINS` | `""` | Comma-separated allowed frontend origins |
 
 ---

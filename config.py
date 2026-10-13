@@ -24,6 +24,7 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1")
 _default_ai_model = "deepseek-chat" if "api.deepseek.com" in AI_BASE_URL else "deepseek/deepseek-v4.1-flash"
 AI_MODEL = os.getenv("AI_MODEL", _default_ai_model)
 RATE_LIMIT = os.getenv("RATE_LIMIT", "120/minute")
+AI_SUMMARY_RATE_LIMIT = os.getenv("AI_SUMMARY_RATE_LIMIT", "20/minute")
 
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
 OPTION_PUT_CALL_NAMES = frozenset({"PUT", "CALL"})

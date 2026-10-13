@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 from typing import Optional
 import polars as pl
@@ -12,6 +13,7 @@ from config import (
     AI_MODEL,
     DEEPSEEK_API_KEY,
     RATE_LIMIT,
+    AI_SUMMARY_RATE_LIMIT,
     OPTION_PUT_CALL_NAMES,
     CUSIP_TO_TICKER,
     COMPARE_CACHE_MAX_SIZE,
@@ -181,12 +183,45 @@ def api_save_comparison(accession_1: str, accession_2: str, db):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+def _fetch_cached_summary_sync(cache_key: str) -> Optional[str]:
+    try:
+        with contextlib.contextmanager(get_db_cursor)() as db:
+            db.execute(
+                "SELECT summary FROM ai_summaries WHERE cache_key = %s;",
+                (cache_key,),
+            )
+            cached_row = db.fetchone()
+            if cached_row and cached_row.get("summary"):
+                return cached_row["summary"]
+    except Exception as e:
+        logger.warning(f"Error checking ai_summaries table: {e}")
+    return None
+
+
+def _persist_cached_summary_sync(cache_key: str, summary: str) -> None:
+    try:
+        with contextlib.contextmanager(get_db_cursor)() as db:
+            db.execute(
+                """
+                INSERT INTO ai_summaries (cache_key, summary)
+                VALUES (%s, %s)
+                ON CONFLICT (cache_key) DO NOTHING;
+                """,
+                (cache_key, summary),
+            )
+            conn = getattr(db, "connection", None)
+            if conn and not getattr(conn, "closed", 1):
+                conn.commit()
+            logger.info(f"Persisted AI summary for {cache_key[:8]} to database")
+    except Exception as e:
+        logger.warning(f"Error persisting AI summary to database: {e}")
+
+
 @router.post("/api/ai_summary")
-@limiter.limit(RATE_LIMIT)
+@limiter.limit(AI_SUMMARY_RATE_LIMIT)
 async def openai_call(
     request: Request,
     payload: HoldingsRequest = Body(...),
-    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     api_key_configured = OPENROUTER_API_KEY or DEEPSEEK_API_KEY
     if not api_key_configured or not client:
@@ -276,25 +311,19 @@ async def openai_call(
         )
 
     # Tier 2: DB cache
-    if db:
-        try:
-            db.execute(
-                "SELECT summary FROM ai_summaries WHERE cache_key = %s;",
-                (cache_key,),
+    try:
+        cached_summary = await asyncio.to_thread(_fetch_cached_summary_sync, cache_key)
+        if cached_summary:
+            logger.info(f"Serving AI summary for {cache_key[:8]} from database cache")
+            AI_SUMMARY_CACHE[cache_key] = cached_summary
+            if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
+                AI_SUMMARY_CACHE.popitem(last=False)
+            return JSONResponse(
+                content={"summary": cached_summary},
+                headers={"Cache-Control": "public, max-age=86400, immutable"},
             )
-            cached_row = db.fetchone()
-            if cached_row and cached_row.get("summary"):
-                summary_text = cached_row["summary"]
-                logger.info(f"Serving AI summary for {cache_key[:8]} from database cache")
-                AI_SUMMARY_CACHE[cache_key] = summary_text
-                if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
-                    AI_SUMMARY_CACHE.popitem(last=False)
-                return JSONResponse(
-                    content={"summary": summary_text},
-                    headers={"Cache-Control": "public, max-age=86400, immutable"},
-                )
-        except Exception as e:
-            logger.warning(f"Error checking ai_summaries table: {e}")
+    except Exception as e:
+        logger.warning(f"Error checking database cache for AI summary: {e}")
 
     # Tier 3: Call DeepSeek
     async def _get_summary(title, data_text):
@@ -330,21 +359,10 @@ async def openai_call(
         if not final_summary:
             final_summary = "No significant position changes detected."
 
-        if db:
-            try:
-                db.execute(
-                    """
-                    INSERT INTO ai_summaries (cache_key, summary)
-                    VALUES (%s, %s)
-                    ON CONFLICT (cache_key) DO NOTHING;
-                    """,
-                    (cache_key, final_summary),
-                )
-                if db.connection and not db.connection.closed:
-                    db.connection.commit()
-                logger.info(f"Persisted AI summary for {cache_key[:8]} to database")
-            except Exception as e:
-                logger.warning(f"Error persisting AI summary to database: {e}")
+        try:
+            await asyncio.to_thread(_persist_cached_summary_sync, cache_key, final_summary)
+        except Exception as e:
+            logger.warning(f"Error persisting AI summary to database: {e}")
 
         AI_SUMMARY_CACHE[cache_key] = final_summary
         if len(AI_SUMMARY_CACHE) > AI_SUMMARY_CACHE_MAX_SIZE:
