@@ -19,15 +19,24 @@
 CREATE TABLE IF NOT EXISTS stock_splits (
     cusip VARCHAR(9) NOT NULL,
     period_of_report DATE NOT NULL,
-    split_factor NUMERIC(8, 4) NOT NULL,
+    split_factor NUMERIC(12, 8) NOT NULL,
     holder_count INT NOT NULL DEFAULT 0,
     source VARCHAR(20) DEFAULT 'consensus',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     PRIMARY KEY (cusip, period_of_report)
 );
 
+ALTER TABLE stock_splits ALTER COLUMN split_factor TYPE NUMERIC(12, 8);
 ALTER TABLE stock_splits ADD COLUMN IF NOT EXISTS holder_count INT NOT NULL DEFAULT 0;
 ALTER TABLE stock_splits ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'consensus';
 
 CREATE INDEX IF NOT EXISTS idx_stock_splits_period 
     ON stock_splits (period_of_report);
+
+-- Purge non-standard empirical entries to leave only verified corporate splits
+DELETE FROM stock_splits
+WHERE split_factor NOT IN (
+    0.01, 0.02, 0.04, 0.05, 0.06666667, 0.1, 0.125, 0.14285714, 0.16666667,
+    0.2, 0.25, 0.33333333, 0.5,
+    2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0
+);

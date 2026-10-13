@@ -47,19 +47,45 @@ def get_db_connection():
     return psycopg2.connect(**params)
 
 
-def snap_split_ratio(raw_ratio: float) -> float:
+import math
+from typing import Optional, Any
+
+
+def snap_split_ratio(raw_ratio: Any) -> Optional[float]:
     """
     Snaps an empirical median share ratio to the nearest standard corporate
-    action split ratio if within 5% tolerance, otherwise rounds to 4 decimals.
+    action split ratio if within 5% tolerance (calibrated to 7.5% for reverse
+    splits, e.g. Amcor 1:5). Returns None instead of storing raw empirical ratios.
+    Exact reverse-split factors (e.g. 1/3 as 0.33333333) are supported with
+    high precision. When tolerance intervals overlap, snaps to the closest ratio.
+    Safely handles float, int, Decimal, or numeric-convertible inputs.
     """
+    if raw_ratio is None:
+        return None
+    try:
+        val = float(raw_ratio)
+    except (TypeError, ValueError):
+        return None
+
+    if val <= 0 or math.isnan(val) or math.isinf(val):
+        return None
+
     standard_ratios = [
-        0.1, 0.2, 0.25, 1.0 / 3.0, 0.5,  # Reverse splits (1:10, 1:5, 1:4, 1:3, 1:2)
+        0.01, 0.02, 0.04, 0.05, 1.0 / 15.0, 0.1, 0.125, 1.0 / 7.0, 1.0 / 6.0,
+        0.2, 0.25, 1.0 / 3.0, 0.5,  # Reverse splits (1:100, 1:50, 1:25, 1:20, 1:15, 1:10, 1:8, 1:7, 1:6, 1:5, 1:4, 1:3, 1:2)
         2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0  # Forward splits
     ]
+    best_std = None
+    min_rel_diff = float("inf")
     for std in standard_ratios:
-        if abs(raw_ratio - std) / std <= 0.05:
-            return round(std, 4)
-    return round(raw_ratio, 4)
+        tol = 0.075 if std < 1.0 else 0.05
+        rel_diff = abs(val - std) / std
+        if rel_diff <= tol and rel_diff < min_rel_diff:
+            min_rel_diff = rel_diff
+            best_std = std
+    if best_std is not None:
+        return round(best_std, 8)
+    return None
 
 
 def get_predecessor_period(conn, period_str: str) -> str:
@@ -168,9 +194,15 @@ def detect_splits_for_period(conn, curr_period: str, prev_period: str, min_holde
     with conn.cursor() as cur:
         for c in candidates:
             snapped = snap_split_ratio(float(c["median_share_ratio"]))
+            if snapped is None:
+                logger.info(
+                    f"  -> Skipping non-standard split ratio: CUSIP={c['cusip']} ({c['issuer_name']}) | "
+                    f"Holders={c['holder_count']} | Ratio={c['median_share_ratio']}"
+                )
+                continue
             logger.info(
                 f"  -> Split detected: CUSIP={c['cusip']} ({c['issuer_name']}) | "
-                f"Holders={c['holder_count']} | Ratio={snapped:.4f} (Raw: {c['median_share_ratio']})"
+                f"Holders={c['holder_count']} | Ratio={snapped:.8f} (Raw: {c['median_share_ratio']})"
             )
             cur.execute("""
                 INSERT INTO stock_splits (cusip, period_of_report, split_factor, holder_count, source, created_at)

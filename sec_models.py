@@ -61,12 +61,15 @@ class HoldingActivity(BaseModel):
     security_type: Optional[str] = None
 
     # Change Info
-    change_type: str  # 'new', 'closed', 'increased', 'decreased'
+    change_type: str  # 'new', 'closed', 'increased', 'decreased', 'unchanged'
     current_shares: Optional[int] = None
     previous_shares: Optional[int] = None
     change_in_share: Optional[int] = None
     percent_change: Optional[float] = None
     split_factor: Optional[float] = None
+    raw_previous_shares: Optional[int] = None
+    raw_change_in_share: Optional[int] = None
+    raw_percent_change: Optional[float] = None
 
     # Value Info
     current_value: Optional[int] = None

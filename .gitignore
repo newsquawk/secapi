@@ -6,3 +6,4 @@ parquet
 .cmd
 .DS_Store
 test_api.py
+.agents/

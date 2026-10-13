@@ -133,7 +133,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             MIN(i.issuer_name) AS issuer_name,
             SUM(h.value) AS total_value,
             SUM(h.shares_or_principal_amount) AS total_shares,
-            tc.is_common_stock,
+            (tc.is_common_stock AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))) AS is_common_stock,
             -- SH = share count, PRN = principal amount in dollars. The two units
             -- must never be summed or diffed together, so they aggregate (and
             -- join across quarters) separately. NULL/unknown defaults to SH.
@@ -150,7 +150,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
         LEFT JOIN share_type_table st ON h.shares_or_principal_type = st.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
-        GROUP BY h.filing_id, i.cusip, tc.is_common_stock, upper(poc.name),
+        GROUP BY h.filing_id, i.cusip, (tc.is_common_stock AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))), upper(poc.name),
                  CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END
     ),
     FilingTotals AS (
@@ -163,7 +163,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
+            COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -182,6 +182,9 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             hc.previous_shares,
             hc.change_in_share,
             hc.percent_change,
+            hc.raw_previous_shares,
+            hc.raw_change_in_share,
+            hc.raw_percent_change,
             hc.change_type,
             hc.is_common_stock,
             hc.split_factor
@@ -200,10 +203,21 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                 COALESCE(curr.total_value, 0) AS current_value,
                 COALESCE(curr.total_shares, 0) AS current_shares,
                 COALESCE(prev.total_value, 0) AS previous_value,
-                COALESCE(prev.total_shares, 0) AS previous_shares,
+                COALESCE(prev.total_shares, 0)::bigint AS raw_previous_shares,
+                ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint AS previous_shares,
                 ss.split_factor,
-                (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) AS change_in_share,
+                (COALESCE(curr.total_shares, 0) - COALESCE(prev.total_shares, 0))::bigint AS raw_change_in_share,
                 CASE
+                    WHEN prev.total_shares > 0 THEN 
+                        ((COALESCE(curr.total_shares, 0) - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS raw_percent_change,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0
+                    ELSE (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint)
+                END AS change_in_share,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0.0
                     WHEN prev.total_shares > 0 THEN 
                         ((COALESCE(curr.total_shares, 0) - (prev.total_shares * COALESCE(ss.split_factor, 1.0)))::numeric / (prev.total_shares * COALESCE(ss.split_factor, 1.0))) * 100
                     ELSE NULL
@@ -211,6 +225,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                 CASE
                     WHEN prev.cusip IS NULL THEN 'new'
                     WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 'unchanged'
                     WHEN curr.total_shares > ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
                     WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
@@ -227,6 +242,8 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             LEFT JOIN stock_splits ss
                 ON COALESCE(curr.cusip, prev.cusip) = ss.cusip
                AND fwp.period_of_report = ss.period_of_report
+               AND COALESCE(curr.is_common_stock, prev.is_common_stock) = true
+               AND (COALESCE(curr.put_or_call, prev.put_or_call) IS NULL OR COALESCE(curr.put_or_call, prev.put_or_call) NOT IN ('PUT', 'CALL'))
             WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
     )
@@ -248,6 +265,9 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.previous_shares,
         hc.change_in_share,
         ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.raw_previous_shares,
+        hc.raw_change_in_share,
+        ROUND(hc.raw_percent_change::numeric, 2) AS raw_percent_change,
         hc.split_factor,
         hc.current_value,
         hc.previous_value,
@@ -260,8 +280,8 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                  THEN (hc.current_value::numeric) / hc.current_shares END, 2
         ) AS current_price_per_share,
         ROUND(
-            CASE WHEN hc.shares_type <> 'PRN' AND hc.previous_shares > 0
-                 THEN (hc.previous_value::numeric) / (hc.previous_shares * COALESCE(hc.split_factor, 1.0)) END, 2
+            CASE WHEN hc.shares_type <> 'PRN' AND hc.raw_previous_shares > 0
+                 THEN (hc.previous_value::numeric) / (hc.raw_previous_shares * COALESCE(hc.split_factor, 1.0)) END, 2
         ) AS previous_price_per_share,
         ROUND(
             CASE WHEN hc.aum > 0 AND hc.current_value > 0 THEN (hc.current_value::numeric / hc.aum) * 100 ELSE NULL END, 4
@@ -355,7 +375,7 @@ def fetch_changes(
             form_type=f["form_type"],
             filing_date=f["filing_date"],
             period_of_report=f["period_of_report"],
-            aum=f["aum"],
+            aum=int(f["aum"]) if f.get("aum") is not None else None,
             file_number=f["file_number"],
             filing_directory=f["filing_directory"],
             created_at=f["created_at"],
@@ -412,7 +432,7 @@ def fetch_changes(
         env = envelopes.get(acc)
         if env is not None:
             if row.get("aum") is not None:
-                env.aum = row["aum"]
+                env.aum = int(row["aum"])
             d = dict(row)
             d["ticker"] = CUSIP_TO_TICKER.get(d["cusip"])
             env.activities.append(HoldingActivity(**d))

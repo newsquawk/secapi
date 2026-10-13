@@ -31,6 +31,7 @@ class SignificantHolding(BaseModel):
     value: int
     change_type: str
     price_per_share: Optional[float] = None
+    raw_previous_shares: Optional[int] = None
 
 
 class HoldingChange(BaseModel):
@@ -40,6 +41,9 @@ class HoldingChange(BaseModel):
     shares_or_principal_amount: int
     change_in_share: int
     percent_change: Optional[float] = None
+    raw_previous_shares: Optional[int] = None
+    raw_change_in_share: Optional[int] = None
+    raw_percent_change: Optional[float] = None
     price_per_share: Optional[float] = None
     price_per_unit: Optional[float] = None
     change_type: str
@@ -128,6 +132,7 @@ class SmartQuery(str):
             "issuer_join": "",
             "cusip_filter": "",
             "min_value_filter": "",
+            "change_type_filter": "AND hc.change_type IN ('new', 'closed', 'increased', 'decreased')",
             "order_by_clause": "hc.filing_date DESC, hc.created_at DESC",
             "form_type_col": "",
             "form_type_expr": "(SELECT form_type FROM filings WHERE filing_id = fwp.filing_id)",
@@ -296,10 +301,21 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
                 curr.total_value AS current_value,
                 curr.total_shares AS current_shares,
                 prev.total_value AS previous_value,
-                prev.total_shares AS previous_shares,
+                CASE WHEN prev.total_shares IS NOT NULL THEN ROUND(prev.total_shares * CASE WHEN COALESCE(curr.is_common_stock, prev.is_common_stock) THEN COALESCE(ss.split_factor, 1.0) ELSE 1.0 END)::bigint ELSE NULL END AS previous_shares,
+                prev.total_shares::bigint AS raw_previous_shares,
                 ss.split_factor,
-                (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) AS change_in_share,
+                (COALESCE(curr.total_shares, 0) - COALESCE(prev.total_shares, 0))::bigint AS raw_change_in_share,
                 CASE
+                    WHEN prev.total_shares > 0 THEN 
+                        ((COALESCE(curr.total_shares, 0) - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS raw_percent_change,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0
+                    ELSE (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint)
+                END AS change_in_share,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0.0
                     WHEN prev.total_shares > 0 THEN 
                         ((COALESCE(curr.total_shares, 0) - (prev.total_shares * COALESCE(ss.split_factor, 1.0)))::numeric / (prev.total_shares * COALESCE(ss.split_factor, 1.0))) * 100
                     ELSE NULL
@@ -307,6 +323,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
                 CASE
                     WHEN prev.cusip IS NULL THEN 'new'
                     WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 'unchanged'
                     WHEN curr.total_shares > ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
                     WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
@@ -320,6 +337,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
             LEFT JOIN stock_splits ss
                 ON COALESCE(curr.cusip, prev.cusip) = ss.cusip
                AND fwp.period_of_report = ss.period_of_report
+               AND COALESCE(curr.is_common_stock, prev.is_common_stock) = true
             WHERE
                 (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
@@ -339,7 +357,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
     )
     SELECT
         fwp.cik_number AS cik,
-        COALESCE(ft.filing_total_value, fwp.aum) AS aum,
+        COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
         fwp.accession_number AS latest_accession_number,
         fwp.previous_accession_number,
         fwp.company_name,
@@ -357,6 +375,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_issuer,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_closed_cusip,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_shares,
+        MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_closed_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_value,
         MAX(CASE WHEN rc.change_type = 'closed' AND rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
             (rc.previous_value::numeric) / rc.previous_shares
@@ -365,8 +384,12 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_issuer,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_increased_cusip,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_increased_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_increased_previous_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_increased_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_change_in_share,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_percent_change,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_change_in_share END) AS top_increased_raw_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_percent_change END) AS top_increased_raw_percent_change,
         MAX(CASE WHEN rc.change_type = 'increased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
             (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_increased_price,
@@ -374,8 +397,12 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_issuer,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_decreased_cusip,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_decreased_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_decreased_previous_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_decreased_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_change_in_share,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_percent_change,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_change_in_share END) AS top_decreased_raw_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 THEN rc.raw_percent_change END) AS top_decreased_raw_percent_change,
         MAX(CASE WHEN rc.change_type = 'decreased' AND rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
             (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_decreased_price,
@@ -391,6 +418,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_closed_other_issuer,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_closed_other_cusip,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_closed_other_shares,
+        MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_closed_other_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_value END) AS top_closed_other_value,
         MAX(CASE WHEN rc.change_type = 'closed' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.previous_shares > 0 THEN
             (rc.previous_value::numeric) / rc.previous_shares
@@ -399,8 +427,12 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_increased_other_issuer,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_increased_other_cusip,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_increased_other_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_increased_other_previous_shares,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_increased_other_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_increased_other_change_in_share,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_increased_other_percent_change,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_change_in_share END) AS top_increased_other_raw_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_percent_change END) AS top_increased_other_raw_percent_change,
         MAX(CASE WHEN rc.change_type = 'increased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
             (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_increased_other_price,
@@ -408,8 +440,12 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.issuer_name END) AS top_decreased_other_issuer,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.cusip END) AS top_decreased_other_cusip,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.current_shares END) AS top_decreased_other_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.previous_shares END) AS top_decreased_other_previous_shares,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_previous_shares END) AS top_decreased_other_raw_previous_shares,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.change_in_share END) AS top_decreased_other_change_in_share,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.percent_change END) AS top_decreased_other_percent_change,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_change_in_share END) AS top_decreased_other_raw_change_in_share,
+        MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 THEN rc.raw_percent_change END) AS top_decreased_other_raw_percent_change,
         MAX(CASE WHEN rc.change_type = 'decreased' AND NOT rc.is_common_stock AND rc.rn = 1 AND rc.current_shares > 0 THEN
             (rc.current_value::numeric) / rc.current_shares
         ELSE 0 END) AS top_decreased_other_price
@@ -464,7 +500,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
+            COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -481,6 +517,9 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             hc.previous_shares,
             hc.change_in_share,
             hc.percent_change,
+            hc.raw_previous_shares,
+            hc.raw_change_in_share,
+            hc.raw_percent_change,
             hc.change_type,
             hc.is_common_stock,
             hc.split_factor
@@ -494,10 +533,25 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
                 curr.total_value AS current_value,
                 curr.total_shares AS current_shares,
                 prev.total_value AS previous_value,
-                prev.total_shares AS previous_shares,
-                ss.split_factor,
-                (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) AS change_in_share,
                 CASE
+                    WHEN prev.total_shares IS NOT NULL
+                    THEN ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint
+                    ELSE NULL
+                END AS previous_shares,
+                prev.total_shares::bigint AS raw_previous_shares,
+                ss.split_factor,
+                (COALESCE(curr.total_shares, 0) - COALESCE(prev.total_shares, 0))::bigint AS raw_change_in_share,
+                CASE
+                    WHEN prev.total_shares > 0 THEN 
+                        ((COALESCE(curr.total_shares, 0) - prev.total_shares)::numeric / prev.total_shares) * 100
+                    ELSE NULL
+                END AS raw_percent_change,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0
+                    ELSE (COALESCE(curr.total_shares, 0) - ROUND(COALESCE(prev.total_shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint)
+                END AS change_in_share,
+                CASE
+                    WHEN curr.cusip IS NOT NULL AND prev.cusip IS NOT NULL AND ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 0.0
                     WHEN prev.total_shares > 0 THEN 
                         ((COALESCE(curr.total_shares, 0) - (prev.total_shares * COALESCE(ss.split_factor, 1.0)))::numeric / (prev.total_shares * COALESCE(ss.split_factor, 1.0))) * 100
                     ELSE NULL
@@ -505,6 +559,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
                 CASE
                     WHEN prev.cusip IS NULL THEN 'new'
                     WHEN curr.cusip IS NULL THEN 'closed'
+                    WHEN ss.split_factor IS NOT NULL AND ABS(curr.total_shares - ROUND(prev.total_shares * ss.split_factor)::bigint) <= 1 THEN 'unchanged'
                     WHEN curr.total_shares > ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
                     WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
@@ -518,6 +573,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             LEFT JOIN stock_splits ss
                 ON COALESCE(curr.cusip, prev.cusip) = ss.cusip
                AND fwp.period_of_report = ss.period_of_report
+               AND COALESCE(curr.is_common_stock, prev.is_common_stock) = true
             WHERE (curr.cusip IS NOT NULL OR prev.cusip IS NOT NULL)
         ) hc ON true
         WHERE
@@ -539,6 +595,9 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         hc.previous_shares,
         hc.change_in_share,
         ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.raw_previous_shares,
+        hc.raw_change_in_share,
+        ROUND(hc.raw_percent_change::numeric, 2) AS raw_percent_change,
         hc.split_factor,
         hc.current_value,
         hc.previous_value,
@@ -552,7 +611,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         ) AS current_price_per_share,
         ROUND(
             CASE
-                WHEN hc.previous_shares > 0 THEN (hc.previous_value::numeric) / (hc.previous_shares * COALESCE(hc.split_factor, 1.0))
+                WHEN hc.raw_previous_shares > 0 THEN (hc.previous_value::numeric) / (hc.raw_previous_shares * COALESCE(hc.split_factor, 1.0))
                 ELSE 0
             END, 2
         ) AS previous_price_per_share,
@@ -573,7 +632,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
     FROM
         HoldingsComparison hc
     WHERE
-        hc.change_type IN ('new', 'closed', 'increased', 'decreased')
+        1=1 {change_type_filter}
         {min_value_filter}
     ORDER BY
         {order_by_clause};
@@ -690,7 +749,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
-            COALESCE(ft.filing_total_value, fwp.aum) AS aum,
+            COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
             fwp.accession_number,
@@ -760,6 +819,10 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
         hc.previous_shares,
         hc.change_in_share,
         ROUND(hc.percent_change::numeric, 2) AS percent_change,
+        hc.previous_shares AS raw_previous_shares,
+        hc.change_in_share AS raw_change_in_share,
+        ROUND(hc.percent_change::numeric, 2) AS raw_percent_change,
+        NULL::numeric AS split_factor,
         hc.current_value,
         hc.previous_value,
         ABS(COALESCE(hc.current_value, 0) - COALESCE(hc.previous_value, 0)) AS absolute_value_change,
@@ -940,6 +1003,7 @@ def get_latest_stories_v2(
                     cusip=row["top_closed_cusip"],
                     ticker=CUSIP_TO_TICKER.get(row["top_closed_cusip"]),
                     shares_or_principal_amount=row["top_closed_shares"],
+                    raw_previous_shares=row.get("top_closed_raw_previous_shares"),
                     value=row["top_closed_value"],
                     price_per_share=row["top_closed_price"],
                     change_type="closed",
@@ -956,6 +1020,9 @@ def get_latest_stories_v2(
                     shares_or_principal_amount=row["top_increased_shares"],
                     change_in_share=row["top_increased_change_in_share"],
                     percent_change=row["top_increased_percent_change"],
+                    raw_previous_shares=row.get("top_increased_raw_previous_shares"),
+                    raw_change_in_share=row.get("top_increased_raw_change_in_share"),
+                    raw_percent_change=row.get("top_increased_raw_percent_change"),
                     price_per_share=row["top_increased_price"],
                     change_type="increased",
                 )
@@ -971,6 +1038,9 @@ def get_latest_stories_v2(
                     shares_or_principal_amount=row["top_decreased_shares"],
                     change_in_share=row["top_decreased_change_in_share"],
                     percent_change=row["top_decreased_percent_change"],
+                    raw_previous_shares=row.get("top_decreased_raw_previous_shares"),
+                    raw_change_in_share=row.get("top_decreased_raw_change_in_share"),
+                    raw_percent_change=row.get("top_decreased_raw_percent_change"),
                     price_per_share=row["top_decreased_price"],
                     change_type="decreased",
                 )
@@ -998,6 +1068,7 @@ def get_latest_stories_v2(
                     cusip=row["top_closed_other_cusip"],
                     ticker=CUSIP_TO_TICKER.get(row["top_closed_other_cusip"]),
                     shares_or_principal_amount=row["top_closed_other_shares"],
+                    raw_previous_shares=row.get("top_closed_other_raw_previous_shares"),
                     value=row["top_closed_other_value"],
                     price_per_share=row["top_closed_other_price"],
                     change_type="closed",
@@ -1014,6 +1085,9 @@ def get_latest_stories_v2(
                     shares_or_principal_amount=row["top_increased_other_shares"],
                     change_in_share=row["top_increased_other_change_in_share"],
                     percent_change=row["top_increased_other_percent_change"],
+                    raw_previous_shares=row.get("top_increased_other_raw_previous_shares"),
+                    raw_change_in_share=row.get("top_increased_other_raw_change_in_share"),
+                    raw_percent_change=row.get("top_increased_other_raw_percent_change"),
                     price_per_unit=row["top_increased_other_price"],
                     change_type="increased",
                 )
@@ -1029,6 +1103,9 @@ def get_latest_stories_v2(
                     shares_or_principal_amount=row["top_decreased_other_shares"],
                     change_in_share=row["top_decreased_other_change_in_share"],
                     percent_change=row["top_decreased_other_percent_change"],
+                    raw_previous_shares=row.get("top_decreased_other_raw_previous_shares"),
+                    raw_change_in_share=row.get("top_decreased_other_raw_change_in_share"),
+                    raw_percent_change=row.get("top_decreased_other_raw_percent_change"),
                     price_per_unit=row["top_decreased_other_price"],
                     change_type="decreased",
                 )
@@ -1143,18 +1220,6 @@ def _fetch_latest_activity(
     else:
         put_or_call_patterns = ["PUT", "CALL"]
 
-    valid_change_types = {"new", "closed", "increased", "decreased"}
-    if change_type is not None and isinstance(change_type, str) and change_type.strip():
-        ct_clean = change_type.strip().lower()
-        if ct_clean not in valid_change_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid change_type '{change_type}'. Allowed values: {', '.join(sorted(valid_change_types))}.",
-            )
-        allowed_change_types = [ct_clean]
-    else:
-        allowed_change_types = ["new", "closed", "increased", "decreased"]
-
     target_cusip = None
     if ticker is not None and isinstance(ticker, str) and ticker.strip():
         _, resolved_cusip = resolve_identifiers(ticker.strip(), db)
@@ -1180,6 +1245,23 @@ def _fetch_latest_activity(
                 detail=f"Manager with CIK '{cik}' not found.",
             )
         target_company_id = comp_row["company_id"]
+
+    valid_change_types = {"new", "closed", "increased", "decreased", "unchanged"}
+    if change_type is not None and isinstance(change_type, str) and change_type.strip():
+        ct_clean = change_type.strip().lower()
+        if ct_clean not in valid_change_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid change_type '{change_type}'. Allowed values: {', '.join(sorted(valid_change_types))}.",
+            )
+        allowed_change_types = [ct_clean]
+        stock_change_type_filter = f"AND hc.change_type = '{ct_clean}'"
+    elif target_cusip:
+        allowed_change_types = ["new", "closed", "increased", "decreased", "unchanged"]
+        stock_change_type_filter = ""
+    else:
+        allowed_change_types = ["new", "closed", "increased", "decreased"]
+        stock_change_type_filter = "AND hc.change_type IN ('new', 'closed', 'increased', 'decreased')"
 
     actual_min_value = min_value if isinstance(min_value, (int, float)) else None
     min_value_filter = (
@@ -1412,6 +1494,7 @@ def _fetch_latest_activity(
             final_query_template = LATEST_ACTIVITY_QUERY_V3.format(
                 order_by_clause=order_by_clause,
                 min_value_filter=min_value_filter,
+                change_type_filter=stock_change_type_filter,
                 form_type_col=", form_type",
                 form_type_expr="fwp.form_type",
             ).replace("%s", values_string)
