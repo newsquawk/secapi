@@ -42,7 +42,11 @@ logger = logging.getLogger("populate_reference_prices")
 
 def get_db_connection():
     params = _get_db_connection_params()
-    return psycopg2.connect(**params)
+    conn = psycopg2.connect(**params)
+    with conn.cursor() as cur:
+        cur.execute("SET statement_timeout = 0;")
+    conn.commit()
+    return conn
 
 
 def ensure_schema_exists(conn):
@@ -68,8 +72,9 @@ def ensure_schema_exists(conn):
 
 def populate_period(conn, period_str: str, min_samples: int = 3) -> int:
     """
-    Computes common stock median prices for a given period_of_report and
-    upserts them into `reference_prices`.
+    Computes common stock and ETF median prices for a given period_of_report and
+    upserts them into `reference_prices`, mapping them across all option/equity
+    issuer_id variants sharing the 6-character CUSIP root.
     """
     logger.info(f"Computing reference prices for period: {period_str} (min_samples={min_samples})...")
     t0 = time.perf_counter()
@@ -78,6 +83,7 @@ def populate_period(conn, period_str: str, min_samples: int = 3) -> int:
     WITH CommonMedians AS (
         SELECT 
             UPPER(i.cusip) AS cusip,
+            SUBSTRING(UPPER(i.cusip) FROM 1 FOR 6) AS base6,
             ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY (
                 (CASE WHEN f.filing_date < '2023-01-03'::date THEN h.value * 1000 ELSE h.value END)::numeric 
                 / NULLIF(h.shares_or_principal_amount, 0)
@@ -89,7 +95,7 @@ def populate_period(conn, period_str: str, min_samples: int = 3) -> int:
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         WHERE f.period_of_report = %(period)s::date
           AND h.put_or_call = 1 -- Common stock / NONE
-          AND tc.is_common_stock = true
+          AND (tc.is_common_stock = true OR tc.name IN ('TR UNIT', 'UIT EXCHANGE TRADED', 'ETF', 'UNIT', 'SHS', 'SPDR S&P 500 ETF TR', 'S&P 500 ETF TR') OR tc.name ILIKE '%%ETF%%' OR tc.name ILIKE '%%TR UNIT%%')
           AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1) -- SH only
           AND h.shares_or_principal_amount > 0
           AND h.value > 0
@@ -97,14 +103,15 @@ def populate_period(conn, period_str: str, min_samples: int = 3) -> int:
         HAVING count(*) >= %(min_samples)s
     )
     INSERT INTO reference_prices (issuer_id, cusip, period_of_report, median_price, sample_size)
-    SELECT 
+    SELECT DISTINCT ON (i.issuer_id)
         i.issuer_id,
-        cm.cusip,
+        i.cusip,
         %(period)s::date,
         cm.median_price,
         cm.sample_size
     FROM CommonMedians cm
-    JOIN issuers i ON UPPER(i.cusip) = cm.cusip
+    JOIN issuers i ON SUBSTRING(UPPER(i.cusip) FROM 1 FOR 6) = cm.base6
+    ORDER BY i.issuer_id, (UPPER(i.cusip) = cm.cusip) DESC, cm.sample_size DESC
     ON CONFLICT (issuer_id, period_of_report) DO UPDATE 
     SET median_price = EXCLUDED.median_price,
         sample_size = EXCLUDED.sample_size,
