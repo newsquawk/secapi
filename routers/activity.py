@@ -132,6 +132,7 @@ class SmartQuery(str):
             "issuer_join": "",
             "cusip_filter": "",
             "min_value_filter": "",
+            "security_category_filter": "",
             "change_type_filter": "AND hc.change_type IN ('new', 'closed', 'increased', 'decreased')",
             "order_by_clause": "hc.filing_date DESC, hc.created_at DESC",
             "form_type_col": "",
@@ -478,14 +479,31 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             MIN(i.issuer_name) as issuer_name,
             SUM(h.value) as total_value,
             SUM(h.shares_or_principal_amount) as total_shares,
-            tc.is_common_stock
+            tc.is_common_stock,
+            CASE
+                WHEN upper(btrim(st.name)) = 'PRN' 
+                     OR tc.name ~* '\y(CONV|CONVERTIBLE|DEB|DEBENTURE|NOTE|BOND|SUBORDINATED|SR NOTE)\y' THEN 'CONVERTIBLE'
+                WHEN tc.name ~* '\y(ETF|ETFS|TR UNIT|UIT|INDEX FUND|SPDR|ISHARES)\y' 
+                     OR i.issuer_name ~* '\y(ETF|ETFS|ISHARES|SPDR|INDEX FUND)\y' THEN 'ETF'
+                WHEN tc.is_common_stock = true THEN 'COMMON'
+                ELSE 'OTHER'
+            END AS security_category
         FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
         LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
+        LEFT JOIN share_type_table st ON h.shares_or_principal_type = st.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
           AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))
-        GROUP BY h.filing_id, i.cusip, tc.is_common_stock
+        GROUP BY h.filing_id, i.cusip, tc.is_common_stock,
+                 CASE
+                     WHEN upper(btrim(st.name)) = 'PRN' 
+                          OR tc.name ~* '\y(CONV|CONVERTIBLE|DEB|DEBENTURE|NOTE|BOND|SUBORDINATED|SR NOTE)\y' THEN 'CONVERTIBLE'
+                     WHEN tc.name ~* '\y(ETF|ETFS|TR UNIT|UIT|INDEX FUND|SPDR|ISHARES)\y' 
+                          OR i.issuer_name ~* '\y(ETF|ETFS|ISHARES|SPDR|INDEX FUND)\y' THEN 'ETF'
+                     WHEN tc.is_common_stock = true THEN 'COMMON'
+                     ELSE 'OTHER'
+                 END
     ),
     FilingTotals AS (
         SELECT 
@@ -522,6 +540,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             hc.raw_percent_change,
             hc.change_type,
             hc.is_common_stock,
+            hc.security_category,
             hc.split_factor
         FROM
             FilingsWithPrevious fwp
@@ -564,7 +583,8 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
                     WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
                 END as change_type,
-                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock,
+                COALESCE(curr.security_category, prev.security_category) AS security_category
             FROM
                 (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.filing_id) AS curr
             FULL OUTER JOIN
@@ -578,6 +598,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         ) hc ON true
         WHERE
             fwp.previous_filing_id IS NOT NULL
+            {security_category_filter}
     )
     SELECT
         hc.cik_number AS cik,
@@ -590,6 +611,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         hc.issuer_name,
         hc.cusip,
         hc.is_common_stock,
+        hc.security_category,
         hc.change_type,
         hc.current_shares,
         hc.previous_shares,
@@ -815,6 +837,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
         hc.cusip,
         hc.put_or_call,
         FALSE AS is_common_stock,
+        'OPTION' AS security_category,
         hc.change_type,
         hc.current_shares,
         hc.previous_shares,
@@ -1151,6 +1174,7 @@ def _fetch_latest_activity(
     limit: int = 3,
     offset: int = 0,
     security_type: str = "stocks",
+    security_category: Optional[str] = None,
     ticker: Optional[str] = None,
     cik: Optional[str] = None,
     put_or_call: Optional[str] = None,
@@ -1173,6 +1197,18 @@ def _fetch_latest_activity(
             status_code=400,
             detail=f"Invalid security_type '{security_type}'. Allowed values: 'stocks', 'options'.",
         )
+
+    target_sec_cat = None
+    security_category_filter = ""
+    if security_category is not None and isinstance(security_category, str) and security_category.strip():
+        target_sec_cat = security_category.strip().upper()
+        valid_categories = {"COMMON", "ETF", "OPTION", "CONVERTIBLE", "OTHER"}
+        if target_sec_cat not in valid_categories:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid security_category '{security_category}'. Allowed values: {', '.join(sorted(valid_categories))}.",
+            )
+        security_category_filter = "AND hc.security_category = %(target_security_category)s"
 
     allowed_sort_by = {
         "filing_date",
@@ -1496,6 +1532,7 @@ def _fetch_latest_activity(
             final_query_template = LATEST_ACTIVITY_QUERY_V3.format(
                 order_by_clause=order_by_clause,
                 min_value_filter=min_value_filter,
+                security_category_filter=security_category_filter,
                 change_type_filter=stock_change_type_filter,
                 form_type_col=", form_type",
                 form_type_expr="fwp.form_type",
@@ -1505,6 +1542,8 @@ def _fetch_latest_activity(
                 "filing_ids_to_process": list(filing_ids_to_process),
                 "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
             }
+            if target_sec_cat is not None:
+                final_query_params["target_security_category"] = target_sec_cat
             if actual_min_value is not None:
                 final_query_params["min_value"] = actual_min_value
 
@@ -1521,6 +1560,11 @@ def _fetch_latest_activity(
                 or CUSIP_TO_TICKER.get(activity_dict.get("cusip"))
             )
             activity_dict["security_type"] = sec_type
+            if "security_category" not in activity_dict or activity_dict["security_category"] is None:
+                activity_dict["security_category"] = (
+                    "OPTION" if sec_type == "options"
+                    else ("COMMON" if activity_dict.get("is_common_stock") else "OTHER")
+                )
             if "reported_value_total" not in activity_dict or activity_dict["reported_value_total"] is None:
                 activity_dict["reported_value_total"] = activity_dict.get("aum")
             activities.append(HoldingActivity(**activity_dict))
@@ -1545,6 +1589,7 @@ def get_latest_activity_v3(
     limit: int = Query(3, description="Number of *companies* to fetch stories for", ge=1, le=50),
     offset: int = Query(0, description="Number of *companies* to skip for pagination", ge=0),
     security_type: Optional[str] = Query("stocks", description="Filter by security type: 'stocks' or 'options'"),
+    security_category: Optional[str] = Query(None, description="Filter by security category: 'COMMON', 'ETF', 'OPTION', 'CONVERTIBLE', 'OTHER'"),
     ticker: Optional[str] = Query(None, description="Filter by underlying stock ticker or CUSIP (e.g. AAPL, NVDA)"),
     cik: Optional[str] = Query(None, description="Filter by company CIK number (e.g. 0001067983)"),
     put_or_call: Optional[str] = Query(None, description="Filter by option contract type ('PUT' or 'CALL')"),
@@ -1564,6 +1609,7 @@ def get_latest_activity_v3(
         limit=limit,
         offset=offset,
         security_type=security_type or "stocks",
+        security_category=security_category,
         ticker=ticker,
         cik=cik,
         put_or_call=put_or_call,

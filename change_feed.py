@@ -144,7 +144,16 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             -- filing labelled 'Call' does not diff against a predecessor's 'CALL'
             -- as a spurious new/closed pair, and Content Hub receives clean values.
             -- upper(NULL) stays NULL, so stock holdings are unaffected.
-            upper(poc.name) AS put_or_call
+            upper(poc.name) AS put_or_call,
+            CASE
+                WHEN poc.name IS NOT NULL AND upper(poc.name) IN ('PUT', 'CALL') THEN 'OPTION'
+                WHEN upper(btrim(st.name)) = 'PRN' 
+                     OR tc.name ~* '\y(CONV|CONVERTIBLE|DEB|DEBENTURE|NOTE|BOND|SUBORDINATED|SR NOTE)\y' THEN 'CONVERTIBLE'
+                WHEN tc.name ~* '\y(ETF|ETFS|TR UNIT|UIT|INDEX FUND|SPDR|ISHARES)\y' 
+                     OR i.issuer_name ~* '\y(ETF|ETFS|ISHARES|SPDR|INDEX FUND)\y' THEN 'ETF'
+                WHEN tc.is_common_stock = true THEN 'COMMON'
+                ELSE 'OTHER'
+            END AS security_category
         FROM holdings_normalised h
         JOIN issuers i ON h.issuer_id = i.issuer_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
@@ -152,7 +161,16 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         LEFT JOIN share_type_table st ON h.shares_or_principal_type = st.id
         WHERE h.filing_id = ANY(%(filing_ids_to_process)s)
         GROUP BY h.filing_id, i.cusip, (tc.is_common_stock AND (poc.name IS NULL OR upper(poc.name) NOT IN ('PUT', 'CALL'))), upper(poc.name),
-                 CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END
+                 CASE WHEN upper(btrim(st.name)) = 'PRN' THEN 'PRN' ELSE 'SH' END,
+                 CASE
+                     WHEN poc.name IS NOT NULL AND upper(poc.name) IN ('PUT', 'CALL') THEN 'OPTION'
+                     WHEN upper(btrim(st.name)) = 'PRN' 
+                          OR tc.name ~* '\y(CONV|CONVERTIBLE|DEB|DEBENTURE|NOTE|BOND|SUBORDINATED|SR NOTE)\y' THEN 'CONVERTIBLE'
+                     WHEN tc.name ~* '\y(ETF|ETFS|TR UNIT|UIT|INDEX FUND|SPDR|ISHARES)\y' 
+                          OR i.issuer_name ~* '\y(ETF|ETFS|ISHARES|SPDR|INDEX FUND)\y' THEN 'ETF'
+                     WHEN tc.is_common_stock = true THEN 'COMMON'
+                     ELSE 'OTHER'
+                 END
     ),
     FilingTotals AS (
         SELECT
@@ -188,6 +206,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             hc.raw_percent_change,
             hc.change_type,
             hc.is_common_stock,
+            hc.security_category,
             hc.split_factor
         FROM
             FilingsWithPrevious fwp
@@ -231,7 +250,8 @@ CHANGE_FEED_ACTIVITY_QUERY = """
                     WHEN curr.total_shares < ROUND(prev.total_shares * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
                     ELSE 'unchanged'
                 END AS change_type,
-                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock
+                COALESCE(curr.is_common_stock, prev.is_common_stock) AS is_common_stock,
+                COALESCE(curr.security_category, prev.security_category) AS security_category
             FROM
                 (SELECT * FROM AggregatedHoldings WHERE filing_id = fwp.filing_id) AS curr
             FULL OUTER JOIN
@@ -261,6 +281,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         hc.put_or_call,
         hc.shares_type AS shares_or_principal_type,
         hc.is_common_stock,
+        hc.security_category,
         hc.change_type,
         hc.current_shares,
         hc.previous_shares,

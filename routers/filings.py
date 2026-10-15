@@ -710,7 +710,16 @@ def get_holding_by_accession_number(
                 d.name AS investment_discretion,
                 h.voting_authority_sole,
                 h.voting_authority_shared,
-                h.voting_authority_none
+                h.voting_authority_none,
+                CASE
+                    WHEN p.name IS NOT NULL AND upper(p.name) IN ('PUT', 'CALL') THEN 'OPTION'
+                    WHEN upper(btrim(s.name)) = 'PRN' 
+                         OR t.name ~* '\y(CONV|CONVERTIBLE|DEB|DEBENTURE|NOTE|BOND|SUBORDINATED|SR NOTE)\y' THEN 'CONVERTIBLE'
+                    WHEN t.name ~* '\y(ETF|ETFS|TR UNIT|UIT|INDEX FUND|SPDR|ISHARES)\y' 
+                         OR i.issuer_name ~* '\y(ETF|ETFS|ISHARES|SPDR|INDEX FUND)\y' THEN 'ETF'
+                    WHEN t.is_common_stock = true THEN 'COMMON'
+                    ELSE 'OTHER'
+                END AS security_category
             FROM holdings_normalised h
             LEFT JOIN issuers i ON h.issuer_id = i.issuer_id
             LEFT JOIN title_of_class_table t ON h.title_of_class = t.id
@@ -738,6 +747,7 @@ def get_holding_by_accession_number(
                 "shares_or_principal_type": row.get("shares_or_principal_type"),
                 "investment_discretion": row.get("investment_discretion"),
                 "put_or_call": row.get("put_or_call"),
+                "security_category": row.get("security_category"),
                 "voting_authority_sole": row.get("voting_authority_sole"),
                 "voting_authority_shared": row.get("voting_authority_shared"),
                 "voting_authority_none": row.get("voting_authority_none"),

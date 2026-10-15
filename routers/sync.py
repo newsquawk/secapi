@@ -4,7 +4,7 @@ from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from config import logger
@@ -166,3 +166,31 @@ async def stream_changes(
             "Content-Encoding": "identity",
         },
     )
+
+
+@router.post(
+    "/sync/maintenance",
+    tags=["Sync"],
+    dependencies=sync_dependencies,
+)
+def trigger_daily_maintenance(
+    background_tasks: BackgroundTasks,
+    recent: int = Query(2, ge=1, le=8, description="Number of recent quarters to maintain"),
+    dry_run: bool = Query(False, description="Dry-run simulation"),
+):
+    """
+    Triggers the automated maintenance pipeline in the background:
+    1. Populates reported_value_total for any newly ingested filings missing totals.
+    2. Refreshes peer-median reference prices for recent quarters.
+    3. Detects consensus corporate stock splits across recent filers.
+
+    Safe for concurrent calls: protected by a PostgreSQL advisory lock.
+    """
+    from scripts.run_daily_maintenance import run_maintenance
+
+    background_tasks.add_task(run_maintenance, recent_quarters=recent, dry_run=dry_run)
+    return {
+        "status": "accepted",
+        "message": f"Maintenance pipeline queued in background for {recent} recent quarters.",
+    }
+

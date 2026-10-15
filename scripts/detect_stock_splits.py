@@ -115,39 +115,49 @@ def detect_splits_for_period(conn, curr_period: str, prev_period: str, min_holde
     t0 = time.perf_counter()
 
     query = """
-    WITH CurrHoldings AS (
+    WITH CurrLatestFilings AS (
+        SELECT DISTINCT ON (company_id) filing_id, company_id
+        FROM filings
+        WHERE period_of_report = %(curr_period)s::date
+          AND form_type IN ('13F-HR', '13F-HR/A')
+        ORDER BY company_id, filing_date DESC, filing_id DESC
+    ),
+    CurrHoldings AS (
         SELECT 
-            f.company_id,
+            clf.company_id,
             h.issuer_id,
             SUM(h.shares_or_principal_amount) AS curr_shares,
             SUM(h.value) AS curr_value
-        FROM filings f
-        JOIN holdings h ON f.filing_id = h.filing_id
+        FROM CurrLatestFilings clf
+        JOIN holdings h ON clf.filing_id = h.filing_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
-        WHERE f.period_of_report = %(curr_period)s::date
-          AND f.form_type IN ('13F-HR', '13F-HR/A')
-          AND h.put_or_call = 1
+        WHERE h.put_or_call = 1
           AND tc.is_common_stock = true
           AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
           AND h.shares_or_principal_amount > 0 AND h.value > 0
-        GROUP BY f.company_id, h.issuer_id
+        GROUP BY clf.company_id, h.issuer_id
+    ),
+    PrevLatestFilings AS (
+        SELECT DISTINCT ON (company_id) filing_id, company_id
+        FROM filings
+        WHERE period_of_report = %(prev_period)s::date
+          AND form_type IN ('13F-HR', '13F-HR/A')
+        ORDER BY company_id, filing_date DESC, filing_id DESC
     ),
     PrevHoldings AS (
         SELECT 
-            f.company_id,
+            plf.company_id,
             h.issuer_id,
             SUM(h.shares_or_principal_amount) AS prev_shares,
             SUM(h.value) AS prev_value
-        FROM filings f
-        JOIN holdings h ON f.filing_id = h.filing_id
+        FROM PrevLatestFilings plf
+        JOIN holdings h ON plf.filing_id = h.filing_id
         JOIN title_of_class_table tc ON h.title_of_class = tc.id
-        WHERE f.period_of_report = %(prev_period)s::date
-          AND f.form_type IN ('13F-HR', '13F-HR/A')
-          AND h.put_or_call = 1
+        WHERE h.put_or_call = 1
           AND tc.is_common_stock = true
           AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
           AND h.shares_or_principal_amount > 0 AND h.value > 0
-        GROUP BY f.company_id, h.issuer_id
+        GROUP BY plf.company_id, h.issuer_id
     ),
     Pairs AS (
         SELECT 
@@ -246,6 +256,7 @@ def main():
     parser = argparse.ArgumentParser(description="Detect 13F consensus stock splits across filers.")
     parser.add_argument("--period", help="Specific period_of_report to process (YYYY-MM-DD)")
     parser.add_argument("--recent", type=int, help="Process the N most recent quarters")
+    parser.add_argument("--all", action="store_true", help="Process all available quarters back to 2020")
     parser.add_argument("--min-holders", type=int, default=10, help="Minimum dual holders (default: 10)")
     args = parser.parse_args()
 
@@ -256,6 +267,8 @@ def main():
         periods_to_run = [args.period]
     elif args.recent:
         periods_to_run = get_available_periods(conn, limit=args.recent)
+    elif args.all:
+        periods_to_run = get_available_periods(conn)
     else:
         periods_to_run = get_available_periods(conn, limit=2)
 

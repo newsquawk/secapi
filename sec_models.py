@@ -34,6 +34,7 @@ class Holding(BaseModel):
     voting_authority_shared: Optional[int] = None
     voting_authority_none: Optional[int] = None
     cusip: Optional[str] = None
+    security_category: Optional[str] = None
 
 
 class HoldingActivity(BaseModel):
@@ -61,6 +62,7 @@ class HoldingActivity(BaseModel):
     # fields below hold that unit, and price_per_share is null for PRN.
     shares_or_principal_type: Optional[str] = None
     security_type: Optional[str] = None
+    security_category: Optional[str] = None
 
     # Change Info
     change_type: str  # 'new', 'closed', 'increased', 'decreased', 'unchanged'

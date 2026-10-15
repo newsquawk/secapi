@@ -237,10 +237,19 @@ class TestStockSplits(unittest.TestCase):
         from datetime import datetime, timezone
         from change_feed import encode_cursor
         from auth import sync_dependencies
+        from database import get_db_connection
         for dep in sync_dependencies:
             app.dependency_overrides[dep.dependency] = lambda: {"sub": "test"}
         try:
-            cursor = encode_cursor(datetime(2026, 8, 14, 20, 25, 24, tzinfo=timezone.utc), 338006)
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT updated_at FROM filings WHERE filing_id = 338006")
+                    row = cur.fetchone()
+                    up_at = row[0] if row else datetime(2026, 8, 14, 20, 25, 24, tzinfo=timezone.utc)
+            finally:
+                conn.close()
+            cursor = encode_cursor(up_at, 338006)
             r_changes = self.client.get(f"/changes?cursor={cursor}&limit=1")
             self.assertEqual(r_changes.status_code, 200)
             items = r_changes.json().get("items", [])
@@ -401,11 +410,20 @@ class TestStockSplits(unittest.TestCase):
         from datetime import datetime, timezone
         from change_feed import encode_cursor
         from auth import sync_dependencies
+        from database import get_db_connection
         for dep in sync_dependencies:
             app.dependency_overrides[dep.dependency] = lambda: {"sub": "test"}
         try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT updated_at FROM filings WHERE filing_id = 334160")
+                    row = cur.fetchone()
+                    up_at = row[0] if row else datetime(2026, 8, 3, 20, 57, 27, 194334, tzinfo=timezone.utc)
+            finally:
+                conn.close()
             # Cursor right before Walleye Trading's 2026-06-30 filing (filing_id 334161)
-            cursor = encode_cursor(datetime(2026, 8, 3, 20, 57, 27, 194334, tzinfo=timezone.utc), 334160)
+            cursor = encode_cursor(up_at, 334160)
             r_chg = self.client.get(f"/changes?cursor={cursor}&limit=5")
             self.assertEqual(r_chg.status_code, 200)
             walleye_items = [it for it in r_chg.json().get("items", []) if it.get("cik") == "1388391"]

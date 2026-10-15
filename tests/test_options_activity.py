@@ -260,7 +260,7 @@ class TestOptionsActivity(unittest.TestCase):
         names_asc = [a["company_name"] for a in r_asc.json().get("activities", [])]
         self.assertGreater(len(names_asc), 1)
         self.assertTrue(
-            all(names_asc[i] <= names_asc[i + 1] for i in range(len(names_asc) - 1)),
+            all(names_asc[i].casefold() <= names_asc[i + 1].casefold() for i in range(len(names_asc) - 1)),
             f"Names not ascending: {names_asc}",
         )
 
@@ -269,7 +269,7 @@ class TestOptionsActivity(unittest.TestCase):
         names_desc = [a["company_name"] for a in r_desc.json().get("activities", [])]
         self.assertGreater(len(names_desc), 1)
         self.assertTrue(
-            all(names_desc[i] >= names_desc[i + 1] for i in range(len(names_desc) - 1)),
+            all(names_desc[i].casefold() >= names_desc[i + 1].casefold() for i in range(len(names_desc) - 1)),
             f"Names not descending: {names_desc}",
         )
 
