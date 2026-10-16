@@ -19,7 +19,15 @@ from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 from config import CUSIP_TO_TICKER
-from sec_models import FilingEnvelope, HoldingActivity
+from holding_enricher import enrich_activities
+from sec_models import (
+    FilingEnvelope,
+    HoldingActivity,
+    compute_is_amendment,
+    compute_amendment_type,
+    compute_is_late_filing,
+)
+
 
 FORM_TYPES = ("13F-HR", "13F-HR/A", "13F-HR/A/A")
 
@@ -90,7 +98,9 @@ FILING_PAGE_QUERY = """
         f.form_type,
         f.file_number,
         f.filing_directory,
+        f.amendment_type,
         c.company_name,
+
         c.cik_number,
         COALESCE(f.reported_value_total, c.aum) AS aum,
         f.reported_value_total,
@@ -182,6 +192,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
+            fwp.company_id,
             COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
@@ -269,6 +280,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         ) hc ON true
     )
     SELECT
+        hc.company_id,
         hc.cik_number AS cik,
         hc.company_name,
         hc.accession_number AS latest_accession_number,
@@ -390,12 +402,17 @@ def fetch_changes(
     filing_tuples = []
     for f in filings:
         acc = f["accession_number"]
+        f_type = f["form_type"]
+        is_amend = compute_is_amendment(f_type)
+        amend_type = compute_amendment_type(f_type, f.get("amendment_type"))
+        is_late = compute_is_late_filing(f["filing_date"], f["period_of_report"])
+
         envelopes[acc] = FilingEnvelope(
             filing_id=f["filing_id"],
             accession_number=acc,
             cik=f["cik_number"],
             company_name=f["company_name"],
-            form_type=f["form_type"],
+            form_type=f_type,
             filing_date=f["filing_date"],
             period_of_report=f["period_of_report"],
             aum=int(f["aum"]) if f.get("aum") is not None else None,
@@ -406,6 +423,9 @@ def fetch_changes(
             updated_at=f["updated_at"],
             previous_filing_id=f["previous_filing_id"],
             previous_accession_number=f["previous_accession_number"],
+            is_amendment=is_amend,
+            amendment_type=amend_type,
+            is_late_filing=is_late,
             activities=[],
         )
         filing_ids_to_process.add(f["filing_id"])
@@ -451,15 +471,20 @@ def fetch_changes(
             "filing_ids_to_process": list(filing_ids_to_process),
         },
     )
-    for row in db.fetchall():
-        acc = row["latest_accession_number"]
+    raw_rows = [dict(r) for r in db.fetchall()]
+    enrich_activities(db, raw_rows)
+    for d in raw_rows:
+        acc = d["latest_accession_number"]
         env = envelopes.get(acc)
         if env is not None:
-            if row.get("aum") is not None:
-                env.aum = int(row["aum"])
-            d = dict(row)
+            if d.get("aum") is not None:
+                env.aum = int(d["aum"])
             d["ticker"] = CUSIP_TO_TICKER.get(d["cusip"])
+            d["is_amendment"] = env.is_amendment
+            d["amendment_type"] = env.amendment_type
+            d["is_late_filing"] = env.is_late_filing
             env.activities.append(HoldingActivity(**d))
+
 
     last = filings[-1]
     next_cursor = encode_cursor(last["updated_at"], last["filing_id"])

@@ -17,7 +17,9 @@ from sec_models import (
     PaginationMetadata,
     ManagersListResponse,
     CompaniesByAumResponse,
+    enrich_filing_dict,
 )
+
 
 router = APIRouter()
 
@@ -212,6 +214,7 @@ def _query_filings(
             SELECT
                 lf.accession_number, lf.form_type, lf.filing_date, lf.period_of_report,
                 lf.file_number, lf.filing_directory, lf.created_at, lf.updated_at,
+                lf.amendment_type,
                 c.company_name, c.cik_number,
                 COALESCE(lf.reported_value_total, c.aum) AS aum,
                 lf.reported_value_total
@@ -225,7 +228,7 @@ def _query_filings(
             CROSS JOIN LATERAL (
                 SELECT f.accession_number, f.form_type, f.filing_date, f.period_of_report,
                        f.file_number, f.filing_directory, f.created_at, f.updated_at,
-                       f.reported_value_total
+                       f.reported_value_total, f.amendment_type
                 FROM filings f
                 WHERE f.company_id = c.company_id
                 ORDER BY f.filing_date DESC, f.accession_number DESC
@@ -270,6 +273,7 @@ def _query_filings(
                 f.filing_directory,
                 f.created_at,
                 f.updated_at,
+                f.amendment_type,
                 c.company_name,
                 c.cik_number,
                 COALESCE(f.reported_value_total, c.aum) AS aum,
@@ -285,9 +289,13 @@ def _query_filings(
         db.execute(filings_query, params)
         filings_data = db.fetchall()
 
+    for row in filings_data:
+        enrich_filing_dict(row)
+
     has_more = (offset + len(filings_data)) < total_count
     next_offset = offset + limit if has_more else None
     return filings_data, total_count, has_more, next_offset
+
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +586,8 @@ def get_filing_by_accession_number(
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """Retrieve filing metadata for a specific accession number."""
+    if "\x00" in accession_number:
+        raise HTTPException(status_code=404, detail="Filing not found")
     try:
         query = """
             SELECT
@@ -589,6 +599,7 @@ def get_filing_by_accession_number(
                 f.filing_directory,
                 f.created_at,
                 f.updated_at,
+                f.amendment_type,
                 c.company_name,
                 c.cik_number,
                 COALESCE(f.reported_value_total, c.aum) AS aum,
@@ -608,9 +619,12 @@ def get_filing_by_accession_number(
                 detail=f"Filing with accession number {accession_number} not found",
             )
 
+        enrich_filing_dict(result)
+
         if response:
             response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=604800, immutable"
         return result
+
 
     except HTTPException:
         raise
@@ -636,6 +650,8 @@ def get_holding_by_accession_number(
     db: psycopg2.extensions.cursor = Depends(get_db_cursor),
 ):
     """Retrieve holdings for a single filing, supporting server-side DataTables pagination and search."""
+    if "\x00" in accession_number:
+        raise HTTPException(status_code=404, detail="Holdings not found")
     try:
         column_map = {
             0: "i.issuer_name",

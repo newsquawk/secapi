@@ -1,6 +1,103 @@
 from pydantic import BaseModel
 import datetime as dt
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
+
+
+def compute_statutory_deadline(
+    period_of_report: Union[dt.date, str, dt.datetime, None]
+) -> Optional[dt.date]:
+    """
+    Authoritative SEC Rule 13f-1(a)(1) & Rule 0-3(a) deadline calculation:
+    1. Base deadline = period_of_report + 45 calendar days.
+    2. Weekend roll-forward: Saturday -> Monday (+2 days), Sunday -> Monday (+1 day).
+    3. Washington's Birthday (Presidents' Day): If rolled deadline falls on the third
+       Monday in February (days 15-21 inclusive), roll forward +1 day to Tuesday.
+    """
+    if not period_of_report:
+        return None
+    if isinstance(period_of_report, str):
+        cleaned = period_of_report.strip()
+        try:
+            period_of_report = dt.date.fromisoformat(cleaned)
+        except ValueError:
+            period_of_report = dt.datetime.fromisoformat(cleaned).date()
+    elif isinstance(period_of_report, dt.datetime):
+        period_of_report = period_of_report.date()
+
+    deadline = period_of_report + dt.timedelta(days=45)
+    # Weekend roll-forward
+    if deadline.weekday() == 5:  # Saturday
+        deadline += dt.timedelta(days=2)
+    elif deadline.weekday() == 6:  # Sunday
+        deadline += dt.timedelta(days=1)
+
+    # Federal holiday roll-forward (Presidents' Day)
+    if deadline.month == 2 and deadline.weekday() == 0 and 15 <= deadline.day <= 21:
+        deadline += dt.timedelta(days=1)
+
+    return deadline
+
+
+def compute_is_late_filing(
+    filing_date: Union[dt.date, str, dt.datetime, None],
+    period_of_report: Union[dt.date, str, dt.datetime, None],
+) -> bool:
+    """True if filing_date > statutory 45-day deadline after period_of_report."""
+    if not filing_date or not period_of_report:
+        return False
+    if isinstance(filing_date, str):
+        cleaned_f = filing_date.strip()
+        try:
+            filing_date = dt.date.fromisoformat(cleaned_f)
+        except ValueError:
+            filing_date = dt.datetime.fromisoformat(cleaned_f).date()
+    elif isinstance(filing_date, dt.datetime):
+        filing_date = filing_date.date()
+    deadline = compute_statutory_deadline(period_of_report)
+    if not deadline:
+        return False
+    return bool(filing_date > deadline)
+
+
+def compute_is_amendment(form_type: Optional[str]) -> bool:
+    """True if filing form indicates an amendment (e.g. 13F-HR/A, 13F-HR/A/A, 13F-NT/A)."""
+    if not form_type:
+        return False
+    ft = str(form_type).strip().upper()
+    return bool("/A" in ft or ft.endswith("/A"))
+
+
+def compute_amendment_type(
+    form_type: Optional[str],
+    raw_amendment_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Distinguishes full portfolio restatements ('restatement') from new-holdings
+    additions ('addition') on 13F-HR/A filings. Returns None for non-amendment filings.
+    """
+    if not compute_is_amendment(form_type):
+        return None
+    if raw_amendment_type:
+        clean = str(raw_amendment_type).strip().lower()
+        if clean in ("addition", "restatement"):
+            return clean
+        if "add" in clean or "new" in clean:
+            return "addition"
+        if "restate" in clean:
+            return "restatement"
+    return "restatement"
+
+
+def enrich_filing_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Enriches a filing dictionary or model attributes with R4 flags."""
+    f_type = d.get("form_type")
+    is_amend = compute_is_amendment(f_type)
+    d["is_amendment"] = is_amend
+    d["amendment_type"] = compute_amendment_type(f_type, d.get("amendment_type"))
+    f_date = d.get("filing_date")
+    p_date = d.get("period_of_report")
+    d["is_late_filing"] = compute_is_late_filing(f_date, p_date)
+    return d
 
 
 class Filing(BaseModel):
@@ -17,6 +114,10 @@ class Filing(BaseModel):
     created_at: dt.datetime
     updated_at: dt.datetime
     reported_value_total: Optional[int] = None
+    is_amendment: bool = False
+    amendment_type: Optional[str] = None
+    is_late_filing: bool = False
+
 
 
 class Holding(BaseModel):
@@ -83,10 +184,23 @@ class HoldingActivity(BaseModel):
     current_price_per_share: Optional[float] = None
     previous_price_per_share: Optional[float] = None
 
+    # Entry Type Info (R1)
+    position_entry_type: Optional[str] = None
+    entry_type: Optional[str] = None
+
+    # Streak Info (R2)
+    streak_quarters: Optional[int] = None
+    streak_direction: Optional[str] = None
+    streak_type: Optional[str] = None
+
     # Downstream Facet Info (content-hub)
     weight_pct: Optional[float] = None
     value_pct: Optional[float] = None
     form_type: Optional[str] = None
+    is_amendment: bool = False
+    amendment_type: Optional[str] = None
+    is_late_filing: bool = False
+
 
 
 class HoldingsRequest(BaseModel):
@@ -134,6 +248,13 @@ class DailyFlowEntry(BaseModel):
     net_change: float
     net_change_pct_float: Optional[float] = None
     percent_change: Optional[float] = None
+    funds_buying: int = 0
+    funds_selling: int = 0
+    funds_new: int = 0
+    funds_increased: int = 0
+    funds_decreased: int = 0
+    funds_closed: int = 0
+    funds_unchanged: int = 0
 
 
 class DailyFlowResponse(BaseModel):
@@ -153,6 +274,13 @@ class AggregateFlowResponse(BaseModel):
     net_change_pct_float: Optional[float] = None
     percent_change: Optional[float] = None
     free_float_shares: Optional[float] = None
+    funds_buying: int = 0
+    funds_selling: int = 0
+    funds_new: int = 0
+    funds_increased: int = 0
+    funds_decreased: int = 0
+    funds_closed: int = 0
+    funds_unchanged: int = 0
 
 
 class TopStockChangeEntry(BaseModel):
@@ -164,12 +292,40 @@ class TopStockChangeEntry(BaseModel):
     absolute_value_change: float
     gross_buying_shares: float
     gross_selling_shares: float
+    funds_buying: int = 0
+    funds_selling: int = 0
+    funds_new: int = 0
+    funds_increased: int = 0
+    funds_decreased: int = 0
+    funds_closed: int = 0
+    funds_unchanged: int = 0
 
 
 class TopStockChangesResponse(BaseModel):
     date: dt.date
     sort_by: str
     stocks: List[TopStockChangeEntry]
+
+
+class QuarterlyFlowEntry(BaseModel):
+    quarter: dt.date
+    gross_buying: float
+    gross_selling: float
+    net_change: float
+    percent_change: Optional[float] = None
+    funds_buying: int = 0
+    funds_selling: int = 0
+    funds_new: int = 0
+    funds_increased: int = 0
+    funds_decreased: int = 0
+    funds_closed: int = 0
+    funds_unchanged: int = 0
+
+
+class QuarterlyFlowResponse(BaseModel):
+    ticker: Optional[str] = None
+    cusip: str
+    quarterly_data: List[QuarterlyFlowEntry]
 
 
 class FilingEnvelope(BaseModel):
@@ -196,6 +352,9 @@ class FilingEnvelope(BaseModel):
     updated_at: Optional[dt.datetime] = None
     previous_filing_id: Optional[int] = None
     previous_accession_number: Optional[str] = None
+    is_amendment: bool = False
+    amendment_type: Optional[str] = None
+    is_late_filing: bool = False
     activities: List[HoldingActivity] = []
 
 
@@ -268,6 +427,10 @@ class FilingListItem(BaseModel):
     cik_number: Optional[str] = None
     aum: Optional[int] = None
     reported_value_total: Optional[int] = None
+    is_amendment: bool = False
+    amendment_type: Optional[str] = None
+    is_late_filing: bool = False
+
 
 
 class FilingsSorting(BaseModel):
@@ -294,6 +457,10 @@ class FilingDetail(BaseModel):
     cik_number: Optional[str] = None
     aum: Optional[int] = None
     reported_value_total: Optional[int] = None
+    is_amendment: bool = False
+    amendment_type: Optional[str] = None
+    is_late_filing: bool = False
+
 
 
 class FilingsByAumResponse(BaseModel):

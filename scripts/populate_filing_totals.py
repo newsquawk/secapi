@@ -213,6 +213,38 @@ def populate_period(conn, period: date, dry_run: bool = False) -> int:
     """, (period,))
     updated_zeros = cur.rowcount
 
+    # Populate amendment_type for any newly ingested 13F-HR/A filings in this period
+    cur.execute("""
+        WITH AmendmentData AS (
+            SELECT 
+                af.filing_id,
+                CASE 
+                    WHEN bf.filing_id IS NULL THEN 'restatement'
+                    WHEN COALESCE(bf.reported_entry_total, 0) >= 50 AND COALESCE(af.reported_entry_total, 0) < 10 THEN 'addition'
+                    WHEN COALESCE(bf.reported_entry_total, 0) > 0 AND (COALESCE(af.reported_entry_total, 0)::numeric / COALESCE(bf.reported_entry_total, 0)) < 0.25 THEN 'addition'
+                    WHEN af.reported_value_total IS NOT NULL AND bf.reported_value_total IS NOT NULL AND bf.reported_value_total > 0 AND (af.reported_value_total::numeric / bf.reported_value_total) < 0.25 AND COALESCE(af.reported_entry_total, 0) < 0.5 * COALESCE(bf.reported_entry_total, 0) THEN 'addition'
+                    ELSE 'restatement'
+                END AS derived_amendment_type
+            FROM filings af
+            LEFT JOIN LATERAL (
+                SELECT filing_id, reported_entry_total, reported_value_total
+                FROM filings bf
+                WHERE bf.company_id = af.company_id
+                  AND bf.period_of_report = af.period_of_report
+                  AND bf.form_type = '13F-HR'
+                ORDER BY bf.filing_date DESC, bf.filing_id DESC
+                LIMIT 1
+            ) bf ON TRUE
+            WHERE af.period_of_report = %s
+              AND af.form_type LIKE '%%/A%%'
+              AND af.amendment_type IS NULL
+        )
+        UPDATE filings f
+        SET amendment_type = ad.derived_amendment_type
+        FROM AmendmentData ad
+        WHERE f.filing_id = ad.filing_id;
+    """, (period,))
+
     conn.commit()
     elapsed = time.time() - t0
     total_updated = updated_with_holdings + updated_zeros

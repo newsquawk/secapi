@@ -24,7 +24,7 @@ def resolve_identifiers(
     ticker = None
     cusip = None
 
-    is_likely_ticker = len(clean_id) <= 5 and clean_id.isalpha()
+    is_likely_ticker = len(clean_id) <= 5 and (clean_id.isalnum() or "." in clean_id or "-" in clean_id)
 
     # ---------------------------------------------------------
     # PATH A: Assume input is a TICKER

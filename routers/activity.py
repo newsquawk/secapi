@@ -12,7 +12,16 @@ from config import (
     logger,
 )
 from database import get_db_cursor, INTERNAL_ERROR_DETAIL
-from sec_models import LatestActivityResponse, HoldingActivity, PaginationMetadata
+from holding_enricher import enrich_activities
+from sec_models import (
+    LatestActivityResponse,
+    HoldingActivity,
+    PaginationMetadata,
+    compute_is_amendment,
+    compute_amendment_type,
+    compute_is_late_filing,
+)
+
 from utils import resolve_identifiers
 
 router = APIRouter()
@@ -32,6 +41,11 @@ class SignificantHolding(BaseModel):
     change_type: str
     price_per_share: Optional[float] = None
     raw_previous_shares: Optional[int] = None
+    position_entry_type: Optional[str] = None
+    entry_type: Optional[str] = None
+    streak_quarters: Optional[int] = None
+    streak_direction: Optional[str] = None
+    streak_type: Optional[str] = None
 
 
 class HoldingChange(BaseModel):
@@ -47,6 +61,11 @@ class HoldingChange(BaseModel):
     price_per_share: Optional[float] = None
     price_per_unit: Optional[float] = None
     change_type: str
+    position_entry_type: Optional[str] = None
+    entry_type: Optional[str] = None
+    streak_quarters: Optional[int] = None
+    streak_direction: Optional[str] = None
+    streak_type: Optional[str] = None
 
 
 class StorySummary(BaseModel):
@@ -135,6 +154,7 @@ class SmartQuery(str):
             "security_category_filter": "",
             "change_type_filter": "AND hc.change_type IN ('new', 'closed', 'increased', 'decreased')",
             "order_by_clause": "hc.filing_date DESC, hc.created_at DESC",
+            "limit_clause": "",
             "form_type_col": "",
             "form_type_expr": "(SELECT form_type FROM filings WHERE filing_id = fwp.filing_id)",
         }
@@ -183,7 +203,8 @@ WITH CandidateFilings AS (
         f.period_of_report,
         f.filing_date,
         f.created_at,
-        f.form_type
+        f.form_type,
+        f.amendment_type
     FROM
         filings f
     WHERE
@@ -200,6 +221,7 @@ RankedFilings AS (
         filing_date,
         created_at,
         form_type,
+        amendment_type,
         ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
     FROM
         CandidateFilings
@@ -212,7 +234,8 @@ LatestFilings AS (
         period_of_report,
         filing_date,
         created_at,
-        form_type
+        form_type,
+        amendment_type
     FROM RankedFilings
     WHERE rn = 1
     ORDER BY filing_date DESC, created_at DESC
@@ -226,6 +249,8 @@ SELECT
     lf.filing_date,
     lf.created_at,
     lf.form_type,
+    lf.amendment_type,
+
     c.company_name,
     c.cik_number,
     c.aum,
@@ -357,6 +382,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
         WHERE change_type IN ('new', 'closed', 'increased', 'decreased')
     )
     SELECT
+        fwp.company_id,
         fwp.cik_number AS cik,
         COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
         fwp.accession_number AS latest_accession_number,
@@ -457,7 +483,7 @@ MODIFIED_OPTIMISED_STORIES_QUERY = """
     LEFT JOIN
         RankedChanges rc ON fwp.filing_id = rc.filing_id
     GROUP BY
-        fwp.filing_id, fwp.cik_number, fwp.aum, ft.filing_total_value, fwp.accession_number, fwp.previous_accession_number,
+        fwp.filing_id, fwp.company_id, fwp.cik_number, fwp.aum, ft.filing_total_value, fwp.accession_number, fwp.previous_accession_number,
         fwp.company_name, fwp.period_of_report, fwp.filing_date, fwp.created_at
     ORDER BY
         fwp.filing_date DESC, fwp.created_at DESC;
@@ -472,7 +498,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
     ),
-    AggregatedHoldings AS (
+    AggregatedHoldings AS NOT MATERIALIZED (
         SELECT
             h.filing_id,
             i.cusip,
@@ -518,6 +544,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
+            fwp.company_id,
             COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
@@ -601,6 +628,7 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
             {security_category_filter}
     )
     SELECT
+        hc.company_id,
         hc.cik_number AS cik,
         hc.company_name,
         hc.accession_number AS latest_accession_number,
@@ -657,8 +685,10 @@ LATEST_ACTIVITY_QUERY_V3 = SmartQuery("""
     WHERE
         1=1 {change_type_filter}
         {min_value_filter}
+        {cusip_filter}
     ORDER BY
-        {order_by_clause};
+        {order_by_clause}
+        {limit_clause};
 """)
 
 FILING_QUERY_OPTIONS = SmartQuery("""
@@ -670,7 +700,8 @@ WITH CandidateFilings AS (
         f.period_of_report,
         f.filing_date,
         f.created_at,
-        f.form_type
+        f.form_type,
+        f.amendment_type
     FROM
         filings f
     WHERE
@@ -688,6 +719,7 @@ RankedFilings AS (
         filing_date,
         created_at,
         form_type,
+        amendment_type,
         ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
     FROM
         CandidateFilings
@@ -700,7 +732,8 @@ LatestFilings AS (
         rf.period_of_report,
         rf.filing_date,
         rf.created_at,
-        rf.form_type
+        rf.form_type,
+        rf.amendment_type
     FROM RankedFilings rf
     WHERE rf.rn = 1
       {latest_filter}
@@ -715,6 +748,8 @@ SELECT
     lf.filing_date,
     lf.created_at,
     lf.form_type,
+    lf.amendment_type,
+
     c.company_name,
     c.cik_number,
     c.aum,
@@ -772,6 +807,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
     HoldingsComparison AS (
         SELECT
             fwp.filing_id,
+            fwp.company_id,
             COALESCE(ft.filing_total_value, fwp.aum)::bigint AS aum,
             fwp.cik_number,
             fwp.company_name,
@@ -826,6 +862,7 @@ LATEST_ACTIVITY_QUERY_OPTIONS = SmartQuery("""
             fwp.previous_filing_id IS NOT NULL
     )
     SELECT
+        hc.company_id,
         hc.cik_number AS cik,
         hc.company_name,
         hc.accession_number AS latest_accession_number,
@@ -1006,8 +1043,90 @@ def get_latest_stories_v2(
         db.execute(final_query_template, final_query_params)
         results = db.fetchall()
 
+        story_candidates = []
+        for row in results:
+            if row.get("top_new_issuer") and row.get("top_new_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_new_cusip"),
+                    "change_type": "new",
+                    "_key": (row.get("cik"), row.get("top_new_cusip"), "top_new"),
+                })
+            if row.get("top_new_other_issuer") and row.get("top_new_other_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_new_other_cusip"),
+                    "change_type": "new",
+                    "_key": (row.get("cik"), row.get("top_new_other_cusip"), "top_new_other"),
+                })
+            if row.get("top_closed_issuer") and row.get("top_closed_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_closed_cusip"),
+                    "change_type": "closed",
+                    "_key": (row.get("cik"), row.get("top_closed_cusip"), "top_closed"),
+                })
+            if row.get("top_closed_other_issuer") and row.get("top_closed_other_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_closed_other_cusip"),
+                    "change_type": "closed",
+                    "_key": (row.get("cik"), row.get("top_closed_other_cusip"), "top_closed_other"),
+                })
+            if row.get("top_increased_issuer") and row.get("top_increased_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_increased_cusip"),
+                    "change_type": "increased",
+                    "_key": (row.get("cik"), row.get("top_increased_cusip"), "top_increased"),
+                })
+            if row.get("top_increased_other_issuer") and row.get("top_increased_other_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_increased_other_cusip"),
+                    "change_type": "increased",
+                    "_key": (row.get("cik"), row.get("top_increased_other_cusip"), "top_increased_other"),
+                })
+            if row.get("top_decreased_issuer") and row.get("top_decreased_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_decreased_cusip"),
+                    "change_type": "decreased",
+                    "_key": (row.get("cik"), row.get("top_decreased_cusip"), "top_decreased"),
+                })
+            if row.get("top_decreased_other_issuer") and row.get("top_decreased_other_cusip"):
+                story_candidates.append({
+                    "company_id": row.get("company_id"),
+                    "cik": row.get("cik"),
+                    "reporting_period": row.get("reporting_period"),
+                    "cusip": row.get("top_decreased_other_cusip"),
+                    "change_type": "decreased",
+                    "_key": (row.get("cik"), row.get("top_decreased_other_cusip"), "top_decreased_other"),
+                })
+
+        enrich_activities(db, story_candidates)
+        enrichment_map = {
+            c["_key"]: c
+            for c in story_candidates
+        }
+
         story_summaries = []
         for row in results:
+            top_new_info = enrichment_map.get((row.get("cik"), row.get("top_new_cusip"), "top_new"), {})
             top_new = (
                 SignificantHolding(
                     issuer_name=row["top_new_issuer"],
@@ -1017,11 +1136,17 @@ def get_latest_stories_v2(
                     value=row["top_new_value"],
                     price_per_share=row["top_new_price"],
                     change_type="new",
+                    position_entry_type=top_new_info.get("position_entry_type"),
+                    entry_type=top_new_info.get("entry_type"),
+                    streak_quarters=top_new_info.get("streak_quarters"),
+                    streak_direction=top_new_info.get("streak_direction"),
+                    streak_type=top_new_info.get("streak_type"),
                 )
                 if row["top_new_issuer"]
                 else None
             )
 
+            top_closed_info = enrichment_map.get((row.get("cik"), row.get("top_closed_cusip"), "top_closed"), {})
             top_closed = (
                 SignificantHolding(
                     issuer_name=row["top_closed_issuer"],
@@ -1032,11 +1157,15 @@ def get_latest_stories_v2(
                     value=row["top_closed_value"],
                     price_per_share=row["top_closed_price"],
                     change_type="closed",
+                    streak_quarters=top_closed_info.get("streak_quarters"),
+                    streak_direction=top_closed_info.get("streak_direction"),
+                    streak_type=top_closed_info.get("streak_type"),
                 )
                 if row["top_closed_issuer"]
                 else None
             )
 
+            top_inc_info = enrichment_map.get((row.get("cik"), row.get("top_increased_cusip"), "top_increased"), {})
             top_increased = (
                 HoldingChange(
                     issuer_name=row["top_increased_issuer"],
@@ -1050,11 +1179,15 @@ def get_latest_stories_v2(
                     raw_percent_change=row.get("top_increased_raw_percent_change"),
                     price_per_share=row["top_increased_price"],
                     change_type="increased",
+                    streak_quarters=top_inc_info.get("streak_quarters"),
+                    streak_direction=top_inc_info.get("streak_direction"),
+                    streak_type=top_inc_info.get("streak_type"),
                 )
                 if row["top_increased_issuer"]
                 else None
             )
 
+            top_dec_info = enrichment_map.get((row.get("cik"), row.get("top_decreased_cusip"), "top_decreased"), {})
             top_decreased = (
                 HoldingChange(
                     issuer_name=row["top_decreased_issuer"],
@@ -1068,11 +1201,15 @@ def get_latest_stories_v2(
                     raw_percent_change=row.get("top_decreased_raw_percent_change"),
                     price_per_share=row["top_decreased_price"],
                     change_type="decreased",
+                    streak_quarters=top_dec_info.get("streak_quarters"),
+                    streak_direction=top_dec_info.get("streak_direction"),
+                    streak_type=top_dec_info.get("streak_type"),
                 )
                 if row["top_decreased_issuer"]
                 else None
             )
 
+            top_new_other_info = enrichment_map.get((row.get("cik"), row.get("top_new_other_cusip"), "top_new_other"), {})
             top_new_other = (
                 SignificantHolding(
                     issuer_name=row["top_new_other_issuer"],
@@ -1082,11 +1219,17 @@ def get_latest_stories_v2(
                     value=row["top_new_other_value"],
                     price_per_share=row["top_new_other_price"],
                     change_type="new",
+                    position_entry_type=top_new_other_info.get("position_entry_type"),
+                    entry_type=top_new_other_info.get("entry_type"),
+                    streak_quarters=top_new_other_info.get("streak_quarters"),
+                    streak_direction=top_new_other_info.get("streak_direction"),
+                    streak_type=top_new_other_info.get("streak_type"),
                 )
                 if row.get("top_new_other_issuer")
                 else None
             )
 
+            top_closed_other_info = enrichment_map.get((row.get("cik"), row.get("top_closed_other_cusip"), "top_closed_other"), {})
             top_closed_other = (
                 SignificantHolding(
                     issuer_name=row["top_closed_other_issuer"],
@@ -1097,11 +1240,15 @@ def get_latest_stories_v2(
                     value=row["top_closed_other_value"],
                     price_per_share=row["top_closed_other_price"],
                     change_type="closed",
+                    streak_quarters=top_closed_other_info.get("streak_quarters"),
+                    streak_direction=top_closed_other_info.get("streak_direction"),
+                    streak_type=top_closed_other_info.get("streak_type"),
                 )
                 if row.get("top_closed_other_issuer")
                 else None
             )
 
+            top_inc_other_info = enrichment_map.get((row.get("cik"), row.get("top_increased_other_cusip"), "top_increased_other"), {})
             top_increased_other = (
                 HoldingChange(
                     issuer_name=row["top_increased_other_issuer"],
@@ -1115,11 +1262,15 @@ def get_latest_stories_v2(
                     raw_percent_change=row.get("top_increased_other_raw_percent_change"),
                     price_per_unit=row["top_increased_other_price"],
                     change_type="increased",
+                    streak_quarters=top_inc_other_info.get("streak_quarters"),
+                    streak_direction=top_inc_other_info.get("streak_direction"),
+                    streak_type=top_inc_other_info.get("streak_type"),
                 )
                 if row.get("top_increased_other_issuer")
                 else None
             )
 
+            top_dec_other_info = enrichment_map.get((row.get("cik"), row.get("top_decreased_other_cusip"), "top_decreased_other"), {})
             top_decreased_other = (
                 HoldingChange(
                     issuer_name=row["top_decreased_other_issuer"],
@@ -1133,6 +1284,9 @@ def get_latest_stories_v2(
                     raw_percent_change=row.get("top_decreased_other_raw_percent_change"),
                     price_per_unit=row["top_decreased_other_price"],
                     change_type="decreased",
+                    streak_quarters=top_dec_other_info.get("streak_quarters"),
+                    streak_direction=top_dec_other_info.get("streak_direction"),
+                    streak_type=top_dec_other_info.get("streak_type"),
                 )
                 if row.get("top_decreased_other_issuer")
                 else None
@@ -1534,14 +1688,18 @@ def _fetch_latest_activity(
                 min_value_filter=min_value_filter,
                 security_category_filter=security_category_filter,
                 change_type_filter=stock_change_type_filter,
+                cusip_filter="AND UPPER(hc.cusip) = %(target_cusip)s" if target_cusip else "",
                 form_type_col=", form_type",
                 form_type_expr="fwp.form_type",
+                limit_clause="LIMIT 1000",
             ).replace("%s", values_string)
             final_query_params = {
                 "valid_filing_ids": list(valid_filing_ids),
                 "filing_ids_to_process": list(filing_ids_to_process),
                 "common_stock_pattern": COMMON_STOCK_TITLE_OF_CLASS,
             }
+            if target_cusip:
+                final_query_params["target_cusip"] = target_cusip
             if target_sec_cat is not None:
                 final_query_params["target_security_category"] = target_sec_cat
             if actual_min_value is not None:
@@ -1550,9 +1708,11 @@ def _fetch_latest_activity(
             db.execute(final_query_template, final_query_params)
             results = db.fetchall()[:1000]
 
+        activity_dicts = [dict(row) for row in results]
+        enrich_activities(db, activity_dicts)
+        filing_amendment_types = {f["accession_number"]: f.get("amendment_type") for f in valid_filings}
         activities = []
-        for row in results:
-            activity_dict = dict(row)
+        for activity_dict in activity_dicts:
             clean_cusip = activity_dict["cusip"].upper() if activity_dict.get("cusip") else None
             activity_dict["cusip"] = clean_cusip
             activity_dict["ticker"] = (
@@ -1567,7 +1727,19 @@ def _fetch_latest_activity(
                 )
             if "reported_value_total" not in activity_dict or activity_dict["reported_value_total"] is None:
                 activity_dict["reported_value_total"] = activity_dict.get("aum")
+
+            f_type = activity_dict.get("form_type")
+            is_amend = compute_is_amendment(f_type)
+            activity_dict["is_amendment"] = is_amend
+            acc_num = activity_dict.get("latest_accession_number")
+            amend_type = filing_amendment_types.get(acc_num) or activity_dict.get("amendment_type")
+            activity_dict["amendment_type"] = compute_amendment_type(f_type, amend_type)
+            activity_dict["is_late_filing"] = compute_is_late_filing(
+                activity_dict.get("filing_date"),
+                activity_dict.get("reporting_period") or activity_dict.get("period_of_report"),
+            )
             activities.append(HoldingActivity(**activity_dict))
+
 
         return LatestActivityResponse(
             activities=activities,
