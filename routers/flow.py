@@ -1,5 +1,6 @@
 import datetime as dt
-from typing import Optional
+import json
+from typing import Optional, List
 import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -13,6 +14,9 @@ from sec_models import (
     TopStockChangesResponse,
     QuarterlyFlowEntry,
     QuarterlyFlowResponse,
+    ManagerStockActivity,
+    StockOwnershipSummary,
+    StockManagersResponse,
 )
 from utils import resolve_identifiers, get_free_float
 
@@ -818,3 +822,458 @@ def get_quarterly_stock_flow(
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
+
+
+@router.get("/api/v1/stock/{identifier}/managers", response_model=StockManagersResponse)
+def get_stock_managers(
+    identifier: str,
+    period_of_report: Optional[dt.date] = Query(
+        None,
+        description="Reporting quarter end date (e.g. 2026-06-30). If omitted, defaults to the latest available reporting period for that stock in the database."
+    ),
+    change_type: Optional[str] = Query(
+        None,
+        description="Filter managers by activity. Allowed: all, buyers (new, increased), sellers (decreased, closed), new, increased, decreased, closed, unchanged. Default is all."
+    ),
+    sort_by: str = Query(
+        "value_change",
+        description="Sorting metric. Allowed: value_change, shares_change, current_value, current_shares, company_name."
+    ),
+    sort_dir: str = Query(
+        "desc",
+        description="Direction: asc or desc."
+    ),
+    limit: int = Query(50, ge=1, le=1000, description="Number of managers per page (min: 1, max: 1000)."),
+    offset: int = Query(0, ge=0, description="Offset for pagination."),
+    db: psycopg2.extensions.cursor = Depends(get_db_cursor),
+):
+    """
+    Returns all institutional investment managers (13F filers) holding or trading a specific
+    stock for a given reporting period (quarter), including position changes, dollar values,
+    and portfolio weights.
+    """
+    ticker, clean_cusip = resolve_identifiers(identifier, db)
+
+    if not clean_cusip:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not resolve identifier '{identifier}' to a valid CUSIP.",
+        )
+
+    # 1. Parameter Validation
+    clean_change_type = change_type.strip().lower() if change_type else "all"
+    valid_change_types = {
+        "all", "buyers", "sellers", "new", "increased", "decreased", "closed", "unchanged"
+    }
+    if clean_change_type not in valid_change_types:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid change_type '{change_type}'. Allowed: "
+                "all, buyers, sellers, new, increased, decreased, closed, unchanged."
+            ),
+        )
+
+    clean_sort_by = sort_by.strip().lower()
+    sort_col_map = {
+        "value_change": "value_change",
+        "shares_change": "change_in_shares",
+        "current_value": "current_value",
+        "current_shares": "current_shares",
+        "company_name": "company_name",
+    }
+    if clean_sort_by not in sort_col_map:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid sort_by '{sort_by}'. Allowed: "
+                "value_change, shares_change, current_value, current_shares, company_name."
+            ),
+        )
+
+    clean_sort_dir = sort_dir.strip().lower()
+    if clean_sort_dir not in ("asc", "desc"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sort_dir '{sort_dir}'. Allowed: asc, desc.",
+        )
+
+    try:
+        # 2. Fetch canonical issuer name and verify existence in issuers table
+        db.execute(
+            """
+            SELECT issuer_name FROM issuers
+            WHERE UPPER(cusip) = %(cusip)s
+            ORDER BY (symbol IS NOT NULL) DESC, issuer_id ASC
+            LIMIT 1;
+            """,
+            {"cusip": clean_cusip},
+        )
+        issuer_row = db.fetchone()
+        if not issuer_row:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not resolve identifier '{identifier}' to a valid CUSIP.",
+            )
+        issuer_name = issuer_row["issuer_name"]
+
+        # Fetch available quarters
+        db.execute(
+            """
+            SELECT DISTINCT f.period_of_report
+            FROM filings f
+            JOIN holdings_normalised h ON f.filing_id = h.filing_id
+            WHERE h.issuer_id IN (SELECT issuer_id FROM issuers WHERE UPPER(cusip) = %(cusip)s)
+              AND f.period_of_report <= CURRENT_DATE
+            ORDER BY f.period_of_report DESC
+            LIMIT 12;
+            """,
+            {"cusip": clean_cusip},
+        )
+        available_periods = [row["period_of_report"] for row in db.fetchall()]
+
+        # Determine target period
+        if period_of_report is not None:
+            target_period = period_of_report
+        elif available_periods:
+            target_period = available_periods[0]
+        else:
+            # No holdings found for this stock in any period
+            return StockManagersResponse(
+                ticker=ticker,
+                cusip=clean_cusip,
+                issuer_name=issuer_name,
+                period_of_report=dt.date.today(),
+                available_periods=[],
+                summary=StockOwnershipSummary(
+                    total_managers=0,
+                    total_current_shares=0,
+                    total_current_value=0,
+                    net_shares_change=0,
+                    net_value_change=0,
+                    gross_buying_shares=0,
+                    gross_selling_shares=0,
+                    funds_buying=0,
+                    funds_selling=0,
+                    funds_new=0,
+                    funds_increased=0,
+                    funds_decreased=0,
+                    funds_closed=0,
+                    funds_unchanged=0,
+                ),
+                managers=[],
+                limit=limit,
+                offset=offset,
+                has_next_page=False,
+            )
+
+        # 3. Build filtering and sorting clauses
+        if clean_change_type == "buyers":
+            filter_clause = "WHERE change_type IN ('new', 'increased')"
+        elif clean_change_type == "sellers":
+            filter_clause = "WHERE change_type IN ('decreased', 'closed')"
+        elif clean_change_type != "all":
+            filter_clause = f"WHERE change_type = '{clean_change_type}'"
+        else:
+            filter_clause = ""
+
+        sort_col = sort_col_map[clean_sort_by]
+        sort_direction = "ASC" if clean_sort_dir == "asc" else "DESC"
+        if sort_col == "company_name":
+            order_clause = f"ORDER BY company_name {sort_direction}, current_value DESC"
+        else:
+            order_clause = f"ORDER BY {sort_col} {sort_direction}, current_value DESC, company_name ASC"
+
+        fetch_limit = limit + 1
+
+        query = f"""
+        WITH TargetIssuers AS (
+            SELECT issuer_id, issuer_name FROM issuers WHERE UPPER(cusip) = %(cusip)s
+        ),
+        TargetPeriod AS (
+            SELECT %(target_period)s::date AS period_of_report
+        ),
+        RelevantCompanies AS (
+            SELECT DISTINCT f.company_id
+            FROM holdings h
+            JOIN filings f ON h.filing_id = f.filing_id
+            WHERE h.issuer_id IN (SELECT issuer_id FROM TargetIssuers)
+              AND f.period_of_report >= (SELECT period_of_report - INTERVAL '120 days' FROM TargetPeriod)
+              AND f.period_of_report <= (SELECT period_of_report FROM TargetPeriod)
+              AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+        ),
+        CurrentFilings AS (
+            SELECT DISTINCT ON (f.company_id)
+                f.filing_id AS current_filing_id,
+                f.company_id,
+                f.filing_date,
+                f.accession_number,
+                f.period_of_report,
+                f.form_type
+            FROM filings f
+            JOIN RelevantCompanies rc ON f.company_id = rc.company_id
+            WHERE f.period_of_report = (SELECT period_of_report FROM TargetPeriod)
+              AND f.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+            ORDER BY f.company_id, f.filing_date DESC, f.accession_number DESC
+        ),
+        PreviousFilings AS (
+            SELECT
+                cf.*,
+                pf_sub.filing_id AS previous_filing_id,
+                pf_sub.accession_number AS previous_accession_number
+            FROM CurrentFilings cf
+            LEFT JOIN LATERAL (
+                SELECT f2.filing_id, f2.accession_number
+                FROM filings f2
+                WHERE f2.company_id = cf.company_id
+                  AND f2.period_of_report < cf.period_of_report
+                  AND f2.form_type IN ('13F-HR', '13F-HR/A', '13F-HR/A/A')
+                ORDER BY f2.period_of_report DESC, f2.filing_date DESC, f2.accession_number DESC
+                LIMIT 1
+            ) pf_sub ON TRUE
+        ),
+        HoldingsComparison AS (
+            SELECT
+                pf.company_id,
+                c.company_name,
+                c.cik_number AS cik,
+                c.aum,
+                pf.filing_date,
+                pf.accession_number,
+                pf.previous_accession_number,
+                pf.form_type,
+                COALESCE(curr.shares, 0)::bigint AS current_shares,
+                COALESCE(curr.value, 0)::bigint AS current_value,
+                COALESCE(prev.shares, 0)::bigint AS raw_previous_shares,
+                COALESCE(prev.value, 0)::bigint AS previous_value,
+                ROUND(COALESCE(prev.shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint AS rebased_previous_shares,
+                CASE
+                    WHEN prev.shares IS NULL OR prev.shares = 0 THEN 'new'
+                    WHEN curr.shares IS NULL OR curr.shares = 0 THEN 'closed'
+                    WHEN ABS(COALESCE(curr.shares, 0) - ROUND(COALESCE(prev.shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint) <= 1 THEN 'unchanged'
+                    WHEN COALESCE(curr.shares, 0) > ROUND(COALESCE(prev.shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint THEN 'increased'
+                    WHEN COALESCE(curr.shares, 0) < ROUND(COALESCE(prev.shares, 0) * COALESCE(ss.split_factor, 1.0))::bigint THEN 'decreased'
+                    ELSE 'unchanged'
+                END AS change_type
+            FROM PreviousFilings pf
+            JOIN companies c ON pf.company_id = c.company_id
+            LEFT JOIN LATERAL (
+                SELECT SUM(h.shares_or_principal_amount) AS shares, SUM(h.value) AS value
+                FROM holdings_normalised h
+                JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
+                WHERE h.filing_id = pf.current_filing_id
+                  AND h.issuer_id IN (SELECT issuer_id FROM TargetIssuers)
+                  AND tc.is_common_stock = TRUE
+                  AND (poc.name IS NULL OR UPPER(poc.name) NOT IN ('PUT', 'CALL'))
+                  AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
+            ) curr ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT SUM(h.shares_or_principal_amount) AS shares, SUM(h.value) AS value
+                FROM holdings_normalised h
+                JOIN title_of_class_table tc ON h.title_of_class = tc.id
+                LEFT JOIN put_or_call_table poc ON h.put_or_call = poc.id
+                WHERE h.filing_id = pf.previous_filing_id
+                  AND h.issuer_id IN (SELECT issuer_id FROM TargetIssuers)
+                  AND tc.is_common_stock = TRUE
+                  AND (poc.name IS NULL OR UPPER(poc.name) NOT IN ('PUT', 'CALL'))
+                  AND (h.shares_or_principal_type IS NULL OR h.shares_or_principal_type = 1)
+            ) prev ON TRUE
+            LEFT JOIN stock_splits ss
+                ON ss.cusip = %(cusip)s
+               AND ss.period_of_report = (SELECT period_of_report FROM TargetPeriod)
+            WHERE curr.shares > 0 OR prev.shares > 0
+        ),
+        CalculatedHoldings AS (
+            SELECT
+                hc.*,
+                CASE
+                    WHEN hc.change_type = 'unchanged' THEN 0::bigint
+                    ELSE (hc.current_shares - hc.rebased_previous_shares)::bigint
+                END AS change_in_shares,
+                CASE
+                    WHEN hc.change_type = 'unchanged' THEN 0::bigint
+                    ELSE (hc.current_value - hc.previous_value)::bigint
+                END AS value_change
+            FROM HoldingsComparison hc
+        )
+        SELECT
+            (
+                SELECT json_build_object(
+                    'total_managers', COUNT(*),
+                    'total_current_shares', COALESCE(SUM(current_shares), 0),
+                    'total_current_value', COALESCE(SUM(current_value), 0),
+                    'gross_buying_shares', COALESCE(SUM(CASE WHEN change_type IN ('new', 'increased') THEN change_in_shares ELSE 0 END), 0),
+                    'gross_selling_shares', COALESCE(SUM(CASE WHEN change_type IN ('decreased', 'closed') THEN (rebased_previous_shares - current_shares) ELSE 0 END), 0),
+                    'net_shares_change', COALESCE(SUM(change_in_shares), 0),
+                    'net_value_change', COALESCE(SUM(value_change), 0),
+                    'funds_new', COUNT(CASE WHEN change_type = 'new' THEN 1 END),
+                    'funds_increased', COUNT(CASE WHEN change_type = 'increased' THEN 1 END),
+                    'funds_decreased', COUNT(CASE WHEN change_type = 'decreased' THEN 1 END),
+                    'funds_closed', COUNT(CASE WHEN change_type = 'closed' THEN 1 END),
+                    'funds_unchanged', COUNT(CASE WHEN change_type = 'unchanged' THEN 1 END),
+                    'funds_buying', COUNT(CASE WHEN change_type IN ('new', 'increased') THEN 1 END),
+                    'funds_selling', COUNT(CASE WHEN change_type IN ('decreased', 'closed') THEN 1 END)
+                ) FROM CalculatedHoldings
+            ) AS summary,
+            (
+                SELECT COALESCE(json_agg(m), '[]'::json) FROM (
+                    SELECT
+                        cik,
+                        company_name,
+                        aum,
+                        change_type,
+                        current_shares,
+                        raw_previous_shares AS previous_shares,
+                        rebased_previous_shares,
+                        change_in_shares,
+                        current_value,
+                        previous_value,
+                        value_change,
+                        filing_date,
+                        accession_number,
+                        previous_accession_number,
+                        form_type
+                    FROM CalculatedHoldings
+                    {filter_clause}
+                    {order_clause}
+                    LIMIT %(fetch_limit)s OFFSET %(offset)s
+                ) m
+            ) AS managers;
+        """
+
+        db.execute(
+            query,
+            {
+                "cusip": clean_cusip,
+                "target_period": target_period,
+                "fetch_limit": fetch_limit,
+                "offset": offset,
+            },
+        )
+        row = db.fetchone()
+
+        if not row:
+            summary_dict = {}
+            raw_managers = []
+        else:
+            summary_dict = row.get("summary") or {}
+            raw_managers = row.get("managers") or []
+
+        if isinstance(summary_dict, str):
+            summary_dict = json.loads(summary_dict)
+        if isinstance(raw_managers, str):
+            raw_managers = json.loads(raw_managers)
+
+        summary = StockOwnershipSummary(
+            total_managers=int(summary_dict.get("total_managers") or 0),
+            total_current_shares=int(summary_dict.get("total_current_shares") or 0),
+            total_current_value=int(summary_dict.get("total_current_value") or 0),
+            net_shares_change=int(summary_dict.get("net_shares_change") or 0),
+            net_value_change=int(summary_dict.get("net_value_change") or 0),
+            gross_buying_shares=int(summary_dict.get("gross_buying_shares") or 0),
+            gross_selling_shares=int(summary_dict.get("gross_selling_shares") or 0),
+            funds_buying=int(summary_dict.get("funds_buying") or 0),
+            funds_selling=int(summary_dict.get("funds_selling") or 0),
+            funds_new=int(summary_dict.get("funds_new") or 0),
+            funds_increased=int(summary_dict.get("funds_increased") or 0),
+            funds_decreased=int(summary_dict.get("funds_decreased") or 0),
+            funds_closed=int(summary_dict.get("funds_closed") or 0),
+            funds_unchanged=int(summary_dict.get("funds_unchanged") or 0),
+        )
+
+        has_next_page = len(raw_managers) > limit
+        paged_managers = raw_managers[:limit]
+
+        manager_list = []
+        for m in paged_managers:
+            curr_shares = int(m.get("current_shares") or 0)
+            curr_val = int(m.get("current_value") or 0)
+            prev_shares = int(m.get("previous_shares") or 0)
+            rebased_prev = int(m.get("rebased_previous_shares") or 0)
+            chg_shares = int(m.get("change_in_shares") or 0)
+            val_chg = int(m.get("value_change") or 0)
+            prev_val = int(m.get("previous_value") or 0)
+            ctype = m.get("change_type")
+            aum = m.get("aum")
+            if aum is not None:
+                aum = int(aum)
+
+            # percent_change calculation
+            if ctype == "unchanged":
+                pct_change = 0.0
+            elif ctype == "new":
+                pct_change = None
+            elif ctype == "closed":
+                pct_change = -100.0
+            elif rebased_prev > 0:
+                pct_change = round((chg_shares / rebased_prev) * 100, 2)
+            else:
+                pct_change = None
+
+            # current_price_per_share calculation
+            curr_price = (
+                round(curr_val / curr_shares, 2) if curr_shares > 0 else None
+            )
+
+            # weight_pct calculation
+            if aum and aum > 0 and curr_val > 0:
+                weight = round((curr_val / aum) * 100, 4)
+            elif aum and aum > 0 and ctype == "closed":
+                weight = 0.0
+            else:
+                weight = None
+
+            fdate = m.get("filing_date")
+            if isinstance(fdate, str):
+                fdate = dt.date.fromisoformat(fdate)
+
+            manager_list.append(
+                ManagerStockActivity(
+                    cik=str(m.get("cik") or ""),
+                    company_name=str(m.get("company_name") or ""),
+                    aum=aum,
+                    change_type=ctype,
+                    current_shares=curr_shares,
+                    previous_shares=prev_shares,
+                    rebased_previous_shares=rebased_prev,
+                    change_in_shares=chg_shares,
+                    percent_change=pct_change,
+                    current_value=curr_val,
+                    previous_value=prev_val,
+                    value_change=val_chg,
+                    current_price_per_share=curr_price,
+                    weight_pct=weight,
+                    filing_date=fdate,
+                    accession_number=str(m.get("accession_number") or ""),
+                    previous_accession_number=(
+                        str(m["previous_accession_number"])
+                        if m.get("previous_accession_number")
+                        else None
+                    ),
+                    form_type=str(m.get("form_type") or ""),
+                )
+            )
+
+        return StockManagersResponse(
+            ticker=ticker,
+            cusip=clean_cusip,
+            issuer_name=issuer_name,
+            period_of_report=target_period,
+            available_periods=available_periods,
+            summary=summary,
+            managers=manager_list,
+            limit=limit,
+            offset=offset,
+            has_next_page=has_next_page,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error fetching stock managers for identifier {identifier}: {str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
+

@@ -179,7 +179,7 @@ class TestFlowFundCountsUnit(unittest.TestCase):
 
     def test_daily_flow_cusip_resolution(self):
         """Verify daily flow works when querying with 9-digit CUSIP directly."""
-        res = self.client.get("/api/v1/flow/daily/037833100?days=5")
+        res = self.client.get("/api/v1/flow/daily/037833100?days=30")
         self.assertEqual(res.status_code, 200)
         data = res.json()
         self.assertEqual(data["cusip"], "037833100")

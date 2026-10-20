@@ -48,7 +48,7 @@ class TestE2ER3FlowFunds(unittest.TestCase):
         funds_buying, funds_selling, funds_new, funds_increased, funds_decreased,
         funds_closed, funds_unchanged.
         """
-        res = self.client.get("/api/v1/flow/daily/037833100?days=5")
+        res = self.client.get("/api/v1/flow/daily/037833100?days=30")
         self.assertEqual(res.status_code, 200)
         data = res.json()
         daily_data = data.get("daily_data", [])

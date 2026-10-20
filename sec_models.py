@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import datetime as dt
 from typing import Optional, Dict, Any, List, Union
 
@@ -473,4 +473,59 @@ class DataTablesHoldingsResponse(BaseModel):
     recordsTotal: int
     recordsFiltered: int
     data: List[Dict[str, Any]]
+
+
+class ManagerStockActivity(BaseModel):
+    cik: str
+    company_name: str
+    aum: Optional[int] = None
+    change_type: str = Field(..., description="new | increased | decreased | closed | unchanged")
+    current_shares: int
+    previous_shares: int
+    rebased_previous_shares: int
+    change_in_shares: int
+    percent_change: Optional[float] = None
+    current_value: int
+    previous_value: int
+    value_change: int
+    current_price_per_share: Optional[float] = None
+    weight_pct: Optional[float] = Field(None, description="Position value as % of manager AUM")
+    filing_date: dt.date
+    accession_number: str
+    previous_accession_number: Optional[str] = None
+    form_type: str
+
+
+class StockOwnershipSummary(BaseModel):
+    total_managers: int
+    total_current_shares: int
+    total_current_value: int
+    net_shares_change: int
+    net_value_change: int
+    gross_buying_shares: int
+    gross_selling_shares: int
+    funds_buying: int
+    funds_selling: int
+    funds_new: int
+    funds_increased: int
+    funds_decreased: int
+    funds_closed: int
+    funds_unchanged: int
+
+
+class StockManagersResponse(BaseModel):
+    ticker: Optional[str]
+    cusip: str
+    issuer_name: Optional[str]
+    period_of_report: dt.date
+    available_periods: List[dt.date] = Field(
+        default_factory=list,
+        description="List of recent quarters available for this stock"
+    )
+    summary: StockOwnershipSummary
+    managers: List[ManagerStockActivity]
+    limit: int
+    offset: int
+    has_next_page: bool
+
 
