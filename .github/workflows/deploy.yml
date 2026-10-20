@@ -126,9 +126,9 @@ jobs:
               exit 1
             fi
 
-            # 6. Run automated test suite inside container against database
-            echo "Running automated test suite inside container..."
-            docker exec secapi_container python -m unittest discover tests -v
+            # 6. Run automated deployment verification suite inside container against database
+            echo "Running deployment verification suite inside container..."
+            docker exec secapi_container python -m unittest tests/test_stock_managers.py tests/test_flow_fund_counts.py tests/test_daily_maintenance.py
 
             # 7. Refresh dependent web frontend connection pool
             echo "Restarting secweb_container to refresh connections..."

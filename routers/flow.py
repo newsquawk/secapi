@@ -980,7 +980,7 @@ def get_stock_managers(
         sort_col = sort_col_map[clean_sort_by]
         sort_direction = "ASC" if clean_sort_dir == "asc" else "DESC"
         if sort_col == "company_name":
-            order_clause = f"ORDER BY company_name {sort_direction}, current_value DESC"
+            order_clause = f'ORDER BY company_name COLLATE "C" {sort_direction}, current_value DESC'
         else:
             order_clause = f"ORDER BY {sort_col} {sort_direction}, current_value DESC, company_name ASC"
 
