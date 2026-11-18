@@ -922,7 +922,7 @@ def get_stock_managers(
             """
             SELECT DISTINCT f.period_of_report
             FROM filings f
-            JOIN holdings_normalised h ON f.filing_id = h.filing_id
+            JOIN holdings h ON f.filing_id = h.filing_id
             WHERE h.issuer_id IN (SELECT issuer_id FROM issuers WHERE UPPER(cusip) = %(cusip)s)
               AND f.period_of_report <= CURRENT_DATE
             ORDER BY f.period_of_report DESC

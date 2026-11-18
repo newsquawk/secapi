@@ -710,7 +710,7 @@ WITH CandidateFilings AS (
     ORDER BY f.filing_date DESC, f.created_at DESC
     {candidate_limit}
 ),
-RankedFilings AS (
+RankedFilings AS MATERIALIZED (
     SELECT
         filing_id,
         company_id,
@@ -720,9 +720,23 @@ RankedFilings AS (
         created_at,
         form_type,
         amendment_type,
-        ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
-    FROM
-        CandidateFilings
+        rn
+    FROM (
+        SELECT
+            filing_id,
+            company_id,
+            accession_number,
+            period_of_report,
+            filing_date,
+            created_at,
+            form_type,
+            amendment_type,
+            ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY filing_date DESC, created_at DESC) as rn
+        FROM
+            CandidateFilings
+    ) sub
+    WHERE rn = 1
+    ORDER BY filing_date DESC, created_at DESC
 ),
 LatestFilings AS (
     SELECT
@@ -1481,9 +1495,8 @@ def _fetch_latest_activity(
                     activity_cusip_filter = ""
                     latest_filter = """AND EXISTS (
                         SELECT 1 FROM holdings h
-                        JOIN put_or_call_table p ON h.put_or_call = p.id
                         WHERE h.filing_id = rf.filing_id
-                          AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+                          AND h.put_or_call = ANY(ARRAY(SELECT id FROM put_or_call_table WHERE name ILIKE ANY(%(put_or_call_patterns)s)))
                     )"""
 
                 options_filing_query = FILING_QUERY_OPTIONS.format(
@@ -1556,9 +1569,8 @@ def _fetch_latest_activity(
                 candidate_limit = "LIMIT 10000"
                 latest_filter = """AND EXISTS (
                     SELECT 1 FROM holdings h
-                    JOIN put_or_call_table p ON h.put_or_call = p.id
                     WHERE h.filing_id = rf.filing_id
-                      AND p.name ILIKE ANY(%(put_or_call_patterns)s)
+                      AND h.put_or_call = ANY(ARRAY(SELECT id FROM put_or_call_table WHERE name ILIKE ANY(%(put_or_call_patterns)s)))
                 )"""
                 activity_cusip_filter = ""
 

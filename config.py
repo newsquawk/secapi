@@ -82,7 +82,7 @@ CIK_TO_TICKER: Dict[str, str] = {}
 TICKER_TO_CUSIP: Dict[str, any] = {}
 CUSIP_TO_TICKER: Dict[str, str] = {}
 
-COMPARE_CACHE_MAX_SIZE = 100
+COMPARE_CACHE_MAX_SIZE = 25
 COMPARE_CACHE: OrderedDict[str, dict] = OrderedDict()
 AI_SUMMARY_CACHE_MAX_SIZE = 200
 AI_SUMMARY_CACHE: OrderedDict[str, str] = OrderedDict()

@@ -20,6 +20,7 @@ COPY tests/ ./tests/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+ENV XDG_CACHE_HOME=/tmp
 
 EXPOSE 8000
 
@@ -31,4 +32,4 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "3", "--forwarded-allow-ips", "*", "--no-access-log"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--forwarded-allow-ips", "*", "--no-access-log"]
