@@ -7,7 +7,7 @@ from psycopg2.extras import RealDictCursor
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from config import logger
+from config import limiter, logger, SYNC_RATE_LIMIT
 from database import get_db_cursor, get_db_connection, INTERNAL_ERROR_DETAIL
 from sec_models import ChangesHeadResponse, ChangesResponse
 from auth import sync_dependencies
@@ -29,7 +29,9 @@ router = APIRouter()
     tags=["Sync"],
     dependencies=sync_dependencies,
 )
+@limiter.limit(SYNC_RATE_LIMIT)
 def get_changes_head(
+    request: Request,
     lag_seconds: float = Query(
         DEFAULT_LAG_SECONDS, ge=0, le=3600, description="Hide filings settled less than this many seconds ago"
     ),
@@ -53,7 +55,9 @@ def get_changes_head(
     tags=["Sync"],
     dependencies=sync_dependencies,
 )
+@limiter.limit(SYNC_RATE_LIMIT)
 def get_changes_feed(
+    request: Request,
     cursor: Optional[str] = Query(None, description="Opaque cursor from a prior page's next_cursor"),
     limit: int = Query(
         DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Max filings per page (each carries all its holdings)"

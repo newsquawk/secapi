@@ -21,7 +21,7 @@ class AuthSettings(BaseSettings):
     # Expected `aud` claim. Optional: when unset, audience is not checked
     # (signature + expiry are still verified).
     audience: Optional[str] = None
-    jwks_cache_lifespan: int = 300  # seconds to cache fetched keys
+    jwks_cache_lifespan: int = 3600  # seconds to cache fetched keys
     jwks_timeout: float = 5.0  # seconds for the JWKS HTTP fetch
 
     # --- Authorization for the sync (Content Hub pull) endpoints ---

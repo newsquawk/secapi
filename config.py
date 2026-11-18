@@ -25,6 +25,7 @@ _default_ai_model = "deepseek-chat" if "api.deepseek.com" in AI_BASE_URL else "d
 AI_MODEL = os.getenv("AI_MODEL", _default_ai_model)
 RATE_LIMIT = os.getenv("RATE_LIMIT", "120/minute")
 AI_SUMMARY_RATE_LIMIT = os.getenv("AI_SUMMARY_RATE_LIMIT", "20/minute")
+SYNC_RATE_LIMIT = os.getenv("SYNC_RATE_LIMIT", "600/minute")
 
 COMMON_STOCK_TITLE_OF_CLASS = "COM|CL A|COMMON STOCK|STOCK|COM SHS|CAP STK CL"
 OPTION_PUT_CALL_NAMES = frozenset({"PUT", "CALL"})
@@ -41,6 +42,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("secapi")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # AI Client (OpenRouter / OpenAI compatible)

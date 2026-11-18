@@ -133,7 +133,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
         SELECT * FROM (VALUES %s) AS t (
             filing_id, company_id, accession_number, period_of_report, filing_date,
             created_at,
-            company_name, cik_number, aum, previous_filing_id, previous_accession_number
+            company_name, cik_number, aum, form_type, previous_filing_id, previous_accession_number
         )
         WHERE filing_id = ANY(%(valid_filing_ids)s)
     ),
@@ -201,7 +201,7 @@ CHANGE_FEED_ACTIVITY_QUERY = """
             fwp.period_of_report,
             fwp.filing_date,
             fwp.created_at,
-            (SELECT form_type FROM filings WHERE filing_id = fwp.filing_id) AS form_type,
+            fwp.form_type,
             hc.cusip,
             hc.put_or_call,
             hc.shares_type,
@@ -442,6 +442,7 @@ def fetch_changes(
                 f["company_name"],
                 f["cik_number"],
                 f["aum"],
+                f_type,
                 f["previous_filing_id"],
                 f["previous_accession_number"],
             )
@@ -451,7 +452,7 @@ def fetch_changes(
         db.mogrify(
             # Explicit casts on the nullable predecessor columns: with a single-row
             # VALUES a bare NULL is typed text, breaking `filing_id = prev_id`.
-            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::integer, %s::text)", t
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::integer, %s::text)", t
         ).decode("utf-8")
         for t in filing_tuples
     )

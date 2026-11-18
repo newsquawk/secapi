@@ -257,12 +257,13 @@ def enrich_activities(
         # ---------------------------------------------------------------------
         if new_candidates:
             distinct_new_tuples = list({(comp_id, cusip, rep_period) for _, comp_id, rep_period, cusip in new_candidates})
-            values_clause = ",".join(
-                [cur.mogrify("(%s, %s, %s::date)", t).decode("utf-8") for t in distinct_new_tuples]
-            )
-            cur.execute(f"""
+            c_ids = [t[0] for t in distinct_new_tuples]
+            cusips = [t[1] for t in distinct_new_tuples]
+            periods = [t[2] for t in distinct_new_tuples]
+            cur.execute(
+                """
                 SELECT v.company_id, v.cusip, v.rep_period
-                FROM (VALUES {values_clause}) AS v(company_id, cusip, rep_period)
+                FROM UNNEST(%(c_ids)s::int[], %(cusips)s::text[], %(periods)s::date[]) AS v(company_id, cusip, rep_period)
                 WHERE EXISTS (
                     SELECT 1
                     FROM issuers i
@@ -272,7 +273,9 @@ def enrich_activities(
                       AND f.company_id = v.company_id
                       AND f.period_of_report < v.rep_period
                 );
-            """)
+                """,
+                {"c_ids": c_ids, "cusips": cusips, "periods": periods},
+            )
             reentry_set = set()
             for r in cur.fetchall():
                 c_id = r["company_id"] if isinstance(r, dict) else r[0]
@@ -349,42 +352,30 @@ def enrich_activities(
                 issuer_ids = list(issuer_map.keys())
 
                 if issuer_ids:
-                    comp_to_filings = collections.defaultdict(list)
-                    for f_id, (c_id, _) in filing_id_to_comp_period.items():
-                        comp_to_filings[c_id].append(f_id)
+                    cur.execute(
+                        """
+                        SELECT h.filing_id, h.issuer_id,
+                               (h.put_or_call IN (2, 3, 4, 5)) as is_option,
+                               SUM(h.shares_or_principal_amount) AS total_shares
+                        FROM holdings h
+                        WHERE h.filing_id = ANY(%(f_ids)s)
+                          AND h.issuer_id = ANY(%(i_ids)s)
+                        GROUP BY h.filing_id, h.issuer_id, (h.put_or_call IN (2, 3, 4, 5));
+                        """,
+                        {"f_ids": filing_ids, "i_ids": issuer_ids},
+                    )
 
-                    cusip_to_iss_id = {v: k for k, v in issuer_map.items()}
-                    exact_pairs = set()
-                    for _, comp_id, _, cusip, _, _ in streak_candidates:
-                        iss_id = cusip_to_iss_id.get(cusip)
-                        if iss_id and comp_id in comp_to_filings:
-                            for f_id in comp_to_filings[comp_id]:
-                                exact_pairs.add((f_id, iss_id))
+                    for r in cur.fetchall():
+                        f_id = r["filing_id"] if isinstance(r, dict) else r[0]
+                        iss_id = r["issuer_id"] if isinstance(r, dict) else r[1]
+                        is_opt = bool(r["is_option"] if isinstance(r, dict) else r[2])
+                        tot_shares = int((r["total_shares"] if isinstance(r, dict) else r[3]) or 0)
 
-                    if exact_pairs:
-                        pairs_values = ",".join(
-                            [cur.mogrify("(%s, %s)", p).decode("utf-8") for p in exact_pairs]
-                        )
-                        cur.execute(f"""
-                            SELECT h.filing_id, h.issuer_id,
-                                   (h.put_or_call IN (2, 3, 4, 5)) as is_option,
-                                   SUM(h.shares_or_principal_amount) AS total_shares
-                            FROM (VALUES {pairs_values}) AS v(filing_id, issuer_id)
-                            JOIN holdings h ON h.filing_id = v.filing_id AND h.issuer_id = v.issuer_id
-                            GROUP BY h.filing_id, h.issuer_id, (h.put_or_call IN (2, 3, 4, 5));
-                        """)
-
-                        for r in cur.fetchall():
-                            f_id = r["filing_id"] if isinstance(r, dict) else r[0]
-                            iss_id = r["issuer_id"] if isinstance(r, dict) else r[1]
-                            is_opt = bool(r["is_option"] if isinstance(r, dict) else r[2])
-                            tot_shares = int((r["total_shares"] if isinstance(r, dict) else r[3]) or 0)
-
-                            if f_id in filing_id_to_comp_period and iss_id in issuer_map:
-                                c_id, p_date = filing_id_to_comp_period[f_id]
-                                c_cusip = issuer_map[iss_id]
-                                qi = quarter_index(p_date)
-                                shares_history[(c_id, c_cusip, is_opt)][qi] = tot_shares
+                        if f_id in filing_id_to_comp_period and iss_id in issuer_map:
+                            c_id, p_date = filing_id_to_comp_period[f_id]
+                            c_cusip = issuer_map[iss_id]
+                            qi = quarter_index(p_date)
+                            shares_history[(c_id, c_cusip, is_opt)][qi] = tot_shares
 
             # 4. Evaluate streak for each candidate
             for act, comp_id, rep_period, cusip, change_type, is_option in streak_candidates:
